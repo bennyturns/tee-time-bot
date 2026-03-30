@@ -1,0 +1,9 @@
+[Unit]
+Description=Run Tee Time Booking Bot daily at 6:57 AM (pre-login before 7:00 drop)
+
+[Timer]
+OnCalendar=*-*-* 06:57:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Tee Time Booking Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/bturner/Workspace/tee-time-bot
+Environment=DISPLAY=:0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+ExecStart=/usr/bin/python3.12 /home/bturner/Workspace/tee-time-bot/book_tee_time_fast.py
+TimeoutStartSec=300
+StandardOutput=append:/home/bturner/Workspace/tee-time-bot/cron_booking.log
+StandardError=append:/home/bturner/Workspace/tee-time-bot/cron_booking.log
