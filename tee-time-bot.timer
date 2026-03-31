@@ -1,8 +1,8 @@
 [Unit]
-Description=Run Tee Time Booking Bot daily at 6:57 AM (pre-login before 7:00 drop)
+Description=Run Tee Time Booking Bot daily at 7:26 AM (pre-login before 7:30 drop)
 
 [Timer]
-OnCalendar=*-*-* 06:57:00
+OnCalendar=*-*-* 07:26:00
 Persistent=true
 
 [Install]

@@ -40,7 +40,8 @@ NUM_PLAYERS = int(os.getenv("NUM_PLAYERS", "4"))
 BOOKING_URL = os.getenv("BOOKING_URL", "https://lochmeregm.ezlinksgolf.com")
 DAYS_OUT = int(os.getenv("DAYS_OUT", "14"))
 BOOKING_HOUR = int(os.getenv("BOOKING_HOUR", "7"))  # Hour when new times drop
-BOOKING_MINUTE = int(os.getenv("BOOKING_MINUTE", "0"))  # Minute when new times drop
+BOOKING_MINUTE = int(os.getenv("BOOKING_MINUTE", "30"))  # Minute when new times drop
+POLL_LEAD_SECS = int(os.getenv("POLL_LEAD_SECS", "15"))  # Start polling this many seconds before drop
 
 DRY_RUN = "--dry-run" in sys.argv
 
@@ -184,7 +185,7 @@ async def main():
     page = await browser_session.get_current_page()
     if not page:
         log.error("Could not get page from browser session")
-        return
+        sys.exit(1)
 
     js = page.evaluate  # shorthand
 
@@ -376,91 +377,129 @@ async def main():
         await asyncio.sleep(1)
 
         # ---------------------------------------------------------------
-        # WAIT FOR BOOKING WINDOW: If we're early, wait until the drop
+        # WAIT FOR BOOKING WINDOW: Sit on page, then poll for new times
         # ---------------------------------------------------------------
         now = datetime.now()
         drop_time = now.replace(hour=BOOKING_HOUR, minute=BOOKING_MINUTE, second=0, microsecond=0)
-        if now < drop_time:
-            wait_secs = (drop_time - now).total_seconds()
-            log.info(f"Pre-positioned! Waiting {wait_secs:.0f}s until {drop_time.strftime('%H:%M:%S')} for tee times to drop...")
-            # Sleep in 1-second intervals so we can log countdown
+        poll_start = drop_time - timedelta(seconds=POLL_LEAD_SECS)
+
+        if now < poll_start:
+            wait_secs = (poll_start - now).total_seconds()
+            log.info(f"Pre-positioned! Waiting {wait_secs:.0f}s until {poll_start.strftime('%H:%M:%S')} to start polling...")
+            log.info(f"Drop time: {drop_time.strftime('%H:%M:%S')}, polling starts {POLL_LEAD_SECS}s early")
             while True:
                 now = datetime.now()
-                remaining = (drop_time - now).total_seconds()
+                remaining = (poll_start - now).total_seconds()
                 if remaining <= 0:
                     break
                 if remaining <= 10:
-                    log.info(f"  {remaining:.1f}s until drop...")
+                    log.info(f"  {remaining:.1f}s until polling starts...")
                 elif remaining <= 60:
                     if int(remaining) % 10 == 0:
-                        log.info(f"  {remaining:.0f}s until drop...")
+                        log.info(f"  {remaining:.0f}s until polling starts...")
                 else:
                     if int(remaining) % 30 == 0:
-                        log.info(f"  {remaining:.0f}s until drop...")
+                        log.info(f"  {remaining:.0f}s until polling starts...")
                 await asyncio.sleep(min(1.0, remaining))
 
-            log.info("GO! Tee times should be live now!")
-            # Refresh the page to pick up newly dropped times
-            await js("() => { location.reload(); }")
-            await asyncio.sleep(5)
-            # Re-set date and players after refresh
-            log.info("Re-setting date after refresh...")
-            await js(f"""() => {{
-                var input = document.querySelector('input#pickerDate, input[datepicker]');
-                if (input) {{
-                    input.value = '{target_date_str}';
-                    input.dispatchEvent(new Event('input', {{bubbles: true}}));
-                    input.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    try {{ angular.element(input).triggerHandler('change'); }} catch(e) {{}}
-                }}
-            }}""")
-            await asyncio.sleep(1)
-            await js(f"""() => {{
-                var cells = document.querySelectorAll('.ui-state-default');
-                for (var cell of cells) {{
-                    if (cell.textContent.trim() === '{target_day}') {{
-                        cell.click();
-                        break;
+            log.info("Starting rapid refresh polling for new tee times!")
+
+        if now < drop_time:
+            # Poll by refreshing the page rapidly until morning times appear
+            target_minutes = time_to_minutes(TARGET_TIME)
+            poll_attempt = 0
+            MAX_POLL_ATTEMPTS = 60  # ~60 seconds of polling at 1s intervals
+            tee_times = None
+
+            while poll_attempt < MAX_POLL_ATTEMPTS:
+                poll_attempt += 1
+                now = datetime.now()
+                log.info(f"Poll attempt {poll_attempt} at {now.strftime('%H:%M:%S.%f')[:-3]}...")
+
+                # Refresh and re-apply filters
+                await js("() => { location.reload(); }")
+                await asyncio.sleep(3)
+
+                # Re-set date
+                await js(f"""() => {{
+                    var input = document.querySelector('input#pickerDate, input[datepicker]');
+                    if (input) {{
+                        input.value = '{target_date_str}';
+                        input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        try {{ angular.element(input).triggerHandler('change'); }} catch(e) {{}}
                     }}
-                }}
-            }}""")
-            await asyncio.sleep(2)
-            log.info("Re-setting players after refresh...")
-            await js(f"""() => {{
-                var btn = document.querySelector('button#players-button');
-                if (!btn) {{
-                    btn = Array.from(document.querySelectorAll('button'))
-                        .find(b => b.id && b.id.includes('player'));
-                }}
-                if (btn) btn.click();
-            }}""")
-            await asyncio.sleep(1)
-            await js(f"""() => {{
-                var links = document.querySelectorAll('ul.dropdown-menu a, li a');
-                for (var link of links) {{
-                    if (link.textContent.trim() === '{NUM_PLAYERS}') {{
-                        link.click();
-                        return true;
+                }}""")
+                await asyncio.sleep(1)
+                await js(f"""() => {{
+                    var cells = document.querySelectorAll('.ui-state-default');
+                    for (var cell of cells) {{
+                        if (cell.textContent.trim() === '{target_day}') {{
+                            cell.click();
+                            break;
+                        }}
                     }}
-                }}
-                return false;
-            }}""")
-            await asyncio.sleep(3)
-            log.info("Re-selecting Member Walk 18H after refresh...")
-            await js("""() => {
-                var labels = document.querySelectorAll('label, span, a, div, button');
-                for (var el of labels) {
-                    var text = el.textContent.trim();
-                    if (text === 'Member Walk 18H') {
-                        el.click();
-                        return true;
+                }}""")
+                await asyncio.sleep(1)
+
+                # Re-set players
+                await js(f"""() => {{
+                    var btn = document.querySelector('button#players-button');
+                    if (!btn) {{
+                        btn = Array.from(document.querySelectorAll('button'))
+                            .find(b => b.id && b.id.includes('player'));
+                    }}
+                    if (btn) btn.click();
+                }}""")
+                await asyncio.sleep(0.5)
+                await js(f"""() => {{
+                    var links = document.querySelectorAll('ul.dropdown-menu a, li a');
+                    for (var link of links) {{
+                        if (link.textContent.trim() === '{NUM_PLAYERS}') {{
+                            link.click();
+                            return true;
+                        }}
+                    }}
+                    return false;
+                }}""")
+                await asyncio.sleep(1)
+
+                # Re-select pricing
+                await js("""() => {
+                    var labels = document.querySelectorAll('label, span, a, div, button');
+                    for (var el of labels) {
+                        var text = el.textContent.trim();
+                        if (text === 'Member Walk 18H') {
+                            el.click();
+                            return true;
+                        }
                     }
-                }
-                return false;
-            }""")
-            await asyncio.sleep(3)
-            await js("() => { window.scrollTo(0, 0); }")
-            await asyncio.sleep(1)
+                    return false;
+                }""")
+                await asyncio.sleep(1)
+
+                # Quick scrape — check if morning times exist
+                quick_check = await js("""() => {
+                    var body = document.body.innerText;
+                    // Look for morning times (before noon)
+                    var morningTimes = body.match(/\\b[5-9]:\\d{2}\\s*AM|\\b1[0-1]:\\d{2}\\s*AM/gi);
+                    return morningTimes ? morningTimes.join(',') : '';
+                }""")
+
+                if quick_check:
+                    log.info(f"Morning times detected: {quick_check}")
+                    await js("() => { window.scrollTo(0, 0); }")
+                    await asyncio.sleep(1)
+                    break
+                else:
+                    log.info("  No morning times yet...")
+
+            if not quick_check:
+                log.error(f"No morning times appeared after {MAX_POLL_ATTEMPTS} poll attempts")
+                await screenshot("04_poll_exhausted")
+                sys.exit(1)
+
+            log.info("Morning times are live! Proceeding to scrape and book...")
         else:
             log.info("Booking window already open, proceeding immediately")
 
@@ -675,7 +714,7 @@ async def main():
         if not tee_times:
             log.error("No tee times found")
             await page.screenshot(str(Path(__file__).parent / "debug_no_times.png"))
-            return
+            sys.exit(1)
 
         # Ensure tee_times is a list of dicts
         if isinstance(tee_times, list) and tee_times and isinstance(tee_times[0], str):
@@ -696,7 +735,7 @@ async def main():
 
         if not best:
             log.error(f"No tee times with {NUM_PLAYERS} player slots")
-            return
+            sys.exit(1)
 
         target_mins = time_to_minutes(TARGET_TIME)
         best_mins = time_to_minutes(best["time"])
@@ -773,15 +812,107 @@ async def main():
         if not clicked:
             log.error(f"Could not click VIEW for {best['time']}")
             await screenshot("06_view_click_failed")
-            return
+            sys.exit(1)
 
         log.info(f"VIEW clicked via '{clicked}' strategy")
         await asyncio.sleep(5)
         await screenshot("06_after_view_click")
 
+        # Dismiss any "Existing Reservation" or "Attention" dialogs
+        dismissed = await js("""() => {
+            var dismissed = 0;
+            var buttons = document.querySelectorAll('button');
+            for (var btn of buttons) {
+                if (btn.textContent.trim() === 'OK' && btn.offsetParent !== null) {
+                    btn.click();
+                    dismissed++;
+                }
+            }
+            return dismissed;
+        }""")
+        if dismissed:
+            log.info(f"Dismissed {dismissed} attention dialog(s)")
+            await asyncio.sleep(2)
+
         # Dump page content to understand the booking page
         booking_page = await js("() => document.body.innerText.substring(0, 2000)")
         log.info(f"Booking page content:\n{booking_page}")
+
+        # Handle "Tee Time Adjustment" dialog — time was sniped by someone else
+        # Retry up to 5 times with next-best available time
+        tried_times = set()
+        MAX_RETRIES = 5
+        for attempt in range(MAX_RETRIES):
+            if "Tee Time Adjustment" not in booking_page and "no longer available" not in booking_page:
+                break  # No adjustment dialog — proceed with booking
+
+            tried_times.add(best['time'])
+            log.warning(f"Attempt {attempt + 1}/{MAX_RETRIES}: {best['time']} was taken! Got 'Tee Time Adjustment' dialog.")
+
+            # Click "No" to decline the alternative
+            declined = await js("""() => {
+                var buttons = document.querySelectorAll('button, a, input[type="button"]');
+                for (var btn of buttons) {
+                    if (btn.textContent.trim() === 'No' && btn.offsetParent !== null) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            log.info(f"Declined alternative: {declined}")
+            await asyncio.sleep(2)
+
+            # Pick the next best time we haven't tried yet
+            available_times = [t for t in tee_times if t['time'] not in tried_times]
+            if not available_times:
+                log.error("All tee times have been taken!")
+                await screenshot(f"06_no_alternatives_attempt{attempt + 1}")
+                sys.exit(1)
+
+            best = min(available_times, key=lambda t: abs(time_to_minutes(t['time']) - target_minutes))
+            log.info(f"Trying next best time: {best['time']}")
+
+            # Click VIEW for the new time
+            retry_clicked = await js(f"""() => {{
+                var allEls = Array.from(document.querySelectorAll('*'));
+                var viewEls = allEls.filter(function(el) {{
+                    return el.textContent.trim() === 'VIEW' || el.textContent.trim() === 'View';
+                }});
+                for (var vel of viewEls) {{
+                    var parent = vel;
+                    for (var i = 0; i < 8; i++) {{
+                        if (!parent) break;
+                        if (parent.textContent.includes('{best["time"]}')) {{
+                            vel.click();
+                            return 'found_for_' + '{best["time"]}';
+                        }}
+                        parent = parent.parentElement;
+                    }}
+                }}
+                if (viewEls.length > 0) {{
+                    viewEls[0].click();
+                    return 'found_BUTTON';
+                }}
+                return null;
+            }}""")
+
+            if not retry_clicked:
+                log.error(f"Could not click VIEW for {best['time']}")
+                await screenshot(f"06_retry{attempt + 1}_view_failed")
+                sys.exit(1)
+
+            log.info(f"VIEW clicked via '{retry_clicked}'")
+            await asyncio.sleep(5)
+            await screenshot(f"06_retry{attempt + 1}_after_view")
+
+            booking_page = await js("() => document.body.innerText.substring(0, 2000)")
+            log.info(f"Retry {attempt + 1} page content:\n{booking_page}")
+        else:
+            # Exhausted all retries
+            log.error(f"All {MAX_RETRIES} attempts failed — every time was sniped!")
+            await screenshot("06_all_retries_exhausted")
+            sys.exit(1)
 
         # Step 7: Select "Member Walk 18H" from the options modal
         log.info("Selecting Member Walk 18H from options modal...")
@@ -928,6 +1059,44 @@ async def main():
         page_after_option = await js("() => document.body.innerText.substring(0, 500)")
         log.info(f"After option select:\n{page_after_option}")
 
+        # Set # of Players in the modal to match our target
+        log.info(f"Setting modal player count to {NUM_PLAYERS}...")
+        modal_players = await js(f"""() => {{
+            // Find the "# of Players" dropdown in the modal
+            var selects = document.querySelectorAll('select');
+            for (var sel of selects) {{
+                // Check if this select is for players (look at label or options)
+                var label = sel.closest('.form-group, .row, div')?.querySelector('label');
+                var isPlayerSelect = (label && label.textContent.includes('Player')) ||
+                    sel.id.toLowerCase().includes('player') ||
+                    sel.name?.toLowerCase().includes('player');
+
+                // Also check by option values — player selects have 1,2,3,4
+                if (!isPlayerSelect) {{
+                    var opts = Array.from(sel.options).map(o => o.text.trim());
+                    if (opts.includes('1 player') || opts.includes('2 players') ||
+                        (opts.includes('1') && opts.includes('2') && opts.includes('3') && opts.includes('4'))) {{
+                        isPlayerSelect = true;
+                    }}
+                }}
+
+                if (isPlayerSelect) {{
+                    // Find the option matching our player count
+                    for (var opt of sel.options) {{
+                        if (opt.text.trim() === '{NUM_PLAYERS} players' || opt.text.trim() === '{NUM_PLAYERS}') {{
+                            sel.value = opt.value;
+                            sel.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            try {{ angular.element(sel).triggerHandler('change'); }} catch(e) {{}}
+                            return 'set_to_{NUM_PLAYERS}';
+                        }}
+                    }}
+                }}
+            }}
+            return 'no_player_select_found';
+        }}""")
+        log.info(f"Modal player select result: {modal_players}")
+        await asyncio.sleep(1)
+
         # If still on modal (Continue button needed), click it
         log.info("Looking for Continue button...")
         continued = await js("""() => {
@@ -975,6 +1144,22 @@ async def main():
         await asyncio.sleep(5)
         await screenshot("08_after_verify_continue")
 
+        # Dismiss any "Existing Reservation" dialogs on final page
+        dismissed2 = await js("""() => {
+            var dismissed = 0;
+            var buttons = document.querySelectorAll('button');
+            for (var btn of buttons) {
+                if (btn.textContent.trim() === 'OK' && btn.offsetParent !== null) {
+                    btn.click();
+                    dismissed++;
+                }
+            }
+            return dismissed;
+        }""")
+        if dismissed2:
+            log.info(f"Dismissed {dismissed2} attention dialog(s) on final page")
+            await asyncio.sleep(2)
+
         # Check final page
         final_content = await js("() => document.body.innerText.substring(0, 1500)")
         log.info(f"Final page content:\n{final_content}")
@@ -1015,8 +1200,9 @@ async def main():
             await asyncio.sleep(5)
             await screenshot("09_after_book_click")
         else:
-            log.warning("Could not find final booking button")
+            log.error("Could not find final booking button")
             await screenshot("09_no_book_button")
+            sys.exit(1)
 
         await asyncio.sleep(5)
         elapsed = asyncio.get_event_loop().time() - start_time
@@ -1032,6 +1218,7 @@ async def main():
     except Exception as e:
         log.exception(f"Error: {e}")
         await screenshot("error")
+        sys.exit(1)
     finally:
         await asyncio.sleep(3)
         await browser_session.stop()
