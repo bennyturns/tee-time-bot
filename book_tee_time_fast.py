@@ -44,6 +44,7 @@ BOOKING_MINUTE = int(os.getenv("BOOKING_MINUTE", "30"))  # Minute when new times
 POLL_LEAD_SECS = int(os.getenv("POLL_LEAD_SECS", "15"))  # Start polling this many seconds before drop
 
 DRY_RUN = "--dry-run" in sys.argv
+DEBUG = "--debug" in sys.argv
 
 # Set up logging
 logging.basicConfig(
@@ -89,6 +90,22 @@ def minutes_to_time(mins: int) -> str:
 
 
 
+async def wait_for(page, condition_js, timeout=5.0, interval=0.25, desc="condition"):
+    """Poll a JS condition until it returns truthy, or timeout.
+
+    Returns the truthy value on success, None on timeout.
+    """
+    elapsed = 0.0
+    while elapsed < timeout:
+        result = await page.evaluate(condition_js)
+        if result:
+            return result
+        await asyncio.sleep(interval)
+        elapsed += interval
+    log.warning(f"wait_for timed out after {timeout}s waiting for: {desc}")
+    return None
+
+
 async def find_best_tee_time(tee_times, target_time, num_players):
     """Find the tee time closest to target with enough player slots."""
     target_mins = time_to_minutes(target_time)
@@ -126,12 +143,16 @@ async def main():
     log.info(f"Players:        {NUM_PLAYERS}")
     log.info(f"Booking URL:    {BOOKING_URL}")
     log.info(f"Dry run:        {DRY_RUN}")
+    log.info(f"Debug:          {DEBUG}")
     log.info("=" * 60)
 
     start_time = asyncio.get_event_loop().time()
 
     # ---------------------------------------------------------------
-    # Phase 1: Use browser-use AI ONLY to pass Cloudflare
+    # Phase 1: Pass Cloudflare challenge
+    #   - Pre-navigate and wait so the checkbox shadow DOM renders
+    #   - Hand the agent a page that's ready to click (1-2 LLM steps)
+    #   - Verify with polling before entering Phase 2
     # ---------------------------------------------------------------
     log.info("Phase 1: Passing Cloudflare with AI agent...")
 
@@ -151,28 +172,109 @@ async def main():
     )
     browser_session = BrowserSession(browser_profile=browser_profile, keep_alive=True)
 
-    cloudflare_task = f"""
-    Go to {BOOKING_URL}
+    # Pre-navigate and wait so the agent doesn't waste steps on navigation
+    log.info("Pre-navigating and waiting for Cloudflare checkbox to render...")
+    await browser_session.start()
+    pre_page = await browser_session.get_current_page()
+    await pre_page.goto(BOOKING_URL)
+    await asyncio.sleep(10)  # Let shadow DOM expose the label element
+    log.info("Pre-navigation complete, handing off to AI agent...")
 
-    If you see a Cloudflare "Verify you are human" checkbox, click it and wait
-    for the page to load.
+    # Targeted prompt: click the LABEL, not the div[role=alert], then done immediately
+    cloudflare_task = """
+    You are on a page with a Cloudflare "Verify you are human" checkbox.
 
-    Once the tee time booking page loads (you see tee times, a date picker,
-    and player selection), your job is DONE. Report "CLOUDFLARE_PASSED" and stop.
+    On your VERY FIRST action, do BOTH of these together:
+      1. Click the LABEL element (checkbox-state attribute, text "Verify you are human").
+         Do NOT click the div with role=alert — only the label works.
+      2. Call done("CLOUDFLARE_PASSED").
 
-    Do NOT interact with any booking elements. Just pass Cloudflare and stop.
+    If the booking page is already loaded (date picker, tee times), call done immediately.
+
+    Do NOT wait. Do NOT use JavaScript. Do NOT take extra steps.
     """
 
-    agent = Agent(
-        task=cloudflare_task,
-        llm=llm,
-        use_vision=True,
-        browser_session=browser_session,
-        max_failures=3,
-        max_actions_per_step=2,
-    )
+    MAX_CF_RETRIES = 3
+    CF_POLL_TIMEOUT = 20  # seconds to wait for page transition after agent
+    CF_POLL_INTERVAL = 2
+    cf_passed = False
 
-    result = await agent.run()
+    for cf_attempt in range(1, MAX_CF_RETRIES + 1):
+        log.info(f"Cloudflare agent attempt {cf_attempt}/{MAX_CF_RETRIES}...")
+
+        agent = Agent(
+            task=cloudflare_task,
+            llm=llm,
+            use_vision=True,
+            browser_session=browser_session,
+            max_failures=2,
+            max_actions_per_step=2,
+            flash_mode=True,
+            use_judge=False,
+        )
+        result = await agent.run()
+
+        elapsed = asyncio.get_event_loop().time() - start_time
+        log.info(f"[{elapsed:.1f}s] Agent attempt {cf_attempt} finished")
+
+        # --- Verify: poll the page to confirm Cloudflare is gone ---
+        page_check = await browser_session.get_current_page()
+        if not page_check:
+            log.error("Could not get page for Cloudflare verification")
+            sys.exit(1)
+
+        poll_elapsed = 0.0
+        while poll_elapsed < CF_POLL_TIMEOUT:
+            cf_check = await page_check.evaluate("""() => {
+                var body = document.body ? document.body.innerText : '';
+                var url = window.location.href;
+                var hasChallenge = body.includes('Verify you are human') ||
+                                  body.includes('Just a moment') ||
+                                  body.includes('security verification') ||
+                                  body.includes('security service') ||
+                                  body.includes('malicious bots') ||
+                                  body.includes('not a bot') ||
+                                  url.includes('challenges.cloudflare.com') ||
+                                  !!document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                var isTransitioning = (body.includes('Verifying') && !body.includes('security verification')) ||
+                                     body.trim().length < 50;
+                var hasBookingContent = body.includes('Sign In') ||
+                                       body.includes('Tee Times') ||
+                                       body.includes('Book') ||
+                                       body.includes('Player');
+                return JSON.stringify({
+                    hasChallenge: hasChallenge,
+                    isTransitioning: isTransitioning,
+                    hasBookingContent: hasBookingContent,
+                    url: url,
+                    bodyPreview: body.substring(0, 300)
+                });
+            }""")
+            log.info(f"  Verify poll +{poll_elapsed:.0f}s: {cf_check}")
+
+            cf_status = json.loads(cf_check) if isinstance(cf_check, str) else cf_check
+
+            if not cf_status.get("hasChallenge") and cf_status.get("hasBookingContent"):
+                log.info("Cloudflare passed — booking page confirmed.")
+                cf_passed = True
+                break
+
+            # Active challenge, not transitioning — stop polling, retry agent
+            if cf_status.get("hasChallenge") and not cf_status.get("isTransitioning"):
+                log.info("Challenge still active — will retry agent.")
+                break
+
+            # Transitional state — keep waiting
+            log.info("  Page transitioning...")
+            await asyncio.sleep(CF_POLL_INTERVAL)
+            poll_elapsed += CF_POLL_INTERVAL
+
+        if cf_passed:
+            break
+
+        if cf_attempt >= MAX_CF_RETRIES:
+            log.error(f"Cloudflare not passed after {MAX_CF_RETRIES} attempts. Aborting.")
+            sys.exit(1)
 
     elapsed = asyncio.get_event_loop().time() - start_time
     log.info(f"[{elapsed:.1f}s] Cloudflare phase complete")
@@ -191,6 +293,8 @@ async def main():
 
     debug_dir = Path(__file__).parent
     async def screenshot(name):
+        if not DEBUG:
+            return
         try:
             import base64
             b64 = await page.screenshot(format='png')
@@ -212,23 +316,6 @@ async def main():
         }""")
         await asyncio.sleep(2)
         await screenshot("02_signin_clicked")
-
-        # Check what input fields are visible
-        fields_info = await js("""() => {
-            var inputs = document.querySelectorAll('input');
-            var result = [];
-            inputs.forEach(function(inp) {
-                result.push({
-                    type: inp.type,
-                    name: inp.name,
-                    id: inp.id,
-                    placeholder: inp.placeholder,
-                    visible: inp.offsetParent !== null
-                });
-            });
-            return JSON.stringify(result);
-        }""")
-        log.info(f"Available input fields: {fields_info}")
 
         await js(f"""() => {{
             var userField = document.querySelector("input[name='username'], input[type='email'], input[id*='user'], input[id*='email'], input[name='email'], input[type='text']");
@@ -279,7 +366,7 @@ async def main():
         elapsed = asyncio.get_event_loop().time() - start_time
         log.info(f"[{elapsed:.1f}s] Signed in")
 
-        # Step 2: Set date
+        # Step 2: Set date — combine input value + calendar click
         log.info(f"Setting date to {target_date_str}...")
         target_day = int(target_date_str.split("/")[1])
 
@@ -291,10 +378,7 @@ async def main():
                 input.dispatchEvent(new Event('change', {{bubbles: true}}));
                 try {{ angular.element(input).triggerHandler('change'); }} catch(e) {{}}
             }}
-        }}""")
-        await asyncio.sleep(1)
-
-        await js(f"""() => {{
+            // Click the calendar day cell
             var cells = document.querySelectorAll('.ui-state-default');
             for (var cell of cells) {{
                 if (cell.textContent.trim() === '{target_day}') {{
@@ -303,26 +387,30 @@ async def main():
                 }}
             }}
         }}""")
-        await asyncio.sleep(2)
-
+        # Poll for date to be reflected in page text
+        await wait_for(page, f"""() => {{
+            var body = document.body.innerText;
+            return body.includes('{target_date_str}');
+        }}""", timeout=5, desc="date reflected")
         await screenshot("03b_after_date")
         elapsed = asyncio.get_event_loop().time() - start_time
         log.info(f"[{elapsed:.1f}s] Date set")
 
         # Step 3: Set players
         log.info(f"Setting players to {NUM_PLAYERS}...")
-        # Wait for page to stabilize after date change
-        await asyncio.sleep(2)
         await js(f"""() => {{
             var btn = document.querySelector('button#players-button');
             if (!btn) {{
-                // Try finding by text content
                 btn = Array.from(document.querySelectorAll('button'))
-                    .find(b => b.id && b.id.includes('player'));
+                    .find(function(b) {{ return b.id && b.id.includes('player'); }});
             }}
             if (btn) btn.click();
         }}""")
-        await asyncio.sleep(1)
+        # Poll for dropdown to appear
+        await wait_for(page, """() => {
+            var menu = document.querySelector('ul.dropdown-menu');
+            return menu && menu.offsetParent !== null;
+        }""", timeout=3, desc="player dropdown")
         await js(f"""() => {{
             var links = document.querySelectorAll('ul.dropdown-menu a, li a');
             for (var link of links) {{
@@ -333,8 +421,11 @@ async def main():
             }}
             return false;
         }}""")
-        await asyncio.sleep(3)
-
+        # Poll for player count to be reflected
+        await wait_for(page, f"""() => {{
+            var body = document.body.innerText;
+            return body.includes('{NUM_PLAYERS} players') || body.includes('{NUM_PLAYERS} player');
+        }}""", timeout=5, desc="player count reflected")
         await screenshot("03c_after_players")
         elapsed = asyncio.get_event_loop().time() - start_time
         log.info(f"[{elapsed:.1f}s] Players set")
@@ -350,7 +441,6 @@ async def main():
                     return true;
                 }
             }
-            // Try checkboxes/radio buttons near the text
             var inputs = document.querySelectorAll('input[type="checkbox"], input[type="radio"]');
             for (var inp of inputs) {
                 var parent = inp.parentElement;
@@ -361,20 +451,17 @@ async def main():
             }
             return false;
         }""")
-        await asyncio.sleep(3)
+        # Poll for tee times to load (covers both pricing + any prior reload)
+        await wait_for(page, """() => {
+            var viewBtns = Array.from(document.querySelectorAll('a, button'))
+                .filter(function(el) { return el.textContent.trim() === 'VIEW'; });
+            return viewBtns.length > 0 ? viewBtns.length : null;
+        }""", timeout=8, desc="tee times loaded")
         await screenshot("03d_after_pricing")
         elapsed = asyncio.get_event_loop().time() - start_time
-        log.info(f"[{elapsed:.1f}s] Pricing option set")
+        log.info(f"[{elapsed:.1f}s] Pricing option set, tee times loaded")
 
-        # Wait for tee times to reload after player change
-        log.info("Waiting for tee times to load...")
-        await asyncio.sleep(3)
-
-        # Scroll to top of tee times list first
-        await js("""() => {
-            window.scrollTo(0, 0);
-        }""")
-        await asyncio.sleep(1)
+        await js("() => { window.scrollTo(0, 0); }")
 
         # ---------------------------------------------------------------
         # WAIT FOR BOOKING WINDOW: Sit on page, then poll for new times
@@ -663,14 +750,15 @@ async def main():
 
         log.info("Scraping tee times (scrolling to collect all)...")
 
-        # Scroll through the page to load all tee times, collecting as we go
+        # Scroll through the page to load all tee times, stop early when exhausted
         all_times = set()
         all_results = []
-        for scroll_pass in range(10):
+        consecutive_empty = 0
+        MAX_SCROLL_PASSES = 15
+        for scroll_pass in range(MAX_SCROLL_PASSES):
             raw = await js(SCRAPE_JS)
             if isinstance(raw, str):
-                import json as _json
-                batch = _json.loads(raw)
+                batch = json.loads(raw)
             elif isinstance(raw, list):
                 batch = raw
             else:
@@ -682,9 +770,15 @@ async def main():
                     all_results.append(tt)
                     new_count += 1
             log.info(f"  Scroll pass {scroll_pass+1}: found {len(batch)} times, {new_count} new (total: {len(all_results)})")
-            if scroll_pass < 9:
-                await js("() => { window.scrollBy(0, 800); }")
-                await asyncio.sleep(0.5)
+            if new_count == 0:
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    log.info("  No new times for 2 passes — done scrolling.")
+                    break
+            else:
+                consecutive_empty = 0
+            await js("() => { window.scrollBy(0, 800); }")
+            await asyncio.sleep(0.3)
 
         # Use collected results instead of single scrape
         raw_result = json.dumps(all_results)
@@ -693,8 +787,8 @@ async def main():
 
         # CDP evaluate may return the data in different formats
         if isinstance(raw_result, str):
-            import json as _json
-            tee_times = _json.loads(raw_result)
+
+            tee_times = json.loads(raw_result)
         elif isinstance(raw_result, list):
             tee_times = raw_result
         else:
@@ -705,7 +799,7 @@ async def main():
             await asyncio.sleep(3)
             raw_result = await js(SCRAPE_JS)
             if isinstance(raw_result, str):
-                tee_times = _json.loads(raw_result)
+                tee_times = json.loads(raw_result)
             elif isinstance(raw_result, list):
                 tee_times = raw_result
             else:
@@ -719,7 +813,7 @@ async def main():
         # Ensure tee_times is a list of dicts
         if isinstance(tee_times, list) and tee_times and isinstance(tee_times[0], str):
             log.warning(f"Tee times returned as strings, attempting to parse")
-            tee_times = [_json.loads(t) if isinstance(t, str) else t for t in tee_times]
+            tee_times = [json.loads(t) if isinstance(t, str) else t for t in tee_times]
 
         elapsed = asyncio.get_event_loop().time() - start_time
         log.info(f"[{elapsed:.1f}s] Found {len(tee_times)} tee times")
