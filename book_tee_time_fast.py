@@ -586,13 +586,14 @@ async def main():
             # No full page reload — just nudge the date back and forth to refresh tee times
             target_minutes = time_to_minutes(TARGET_TIME)
             poll_attempt = 0
-            MAX_POLL_ATTEMPTS = 120  # ~2 minutes at ~1s intervals
+            MAX_POLL_ATTEMPTS = 3600  # ~60 minutes at ~1s intervals
             quick_check = None
 
             while poll_attempt < MAX_POLL_ATTEMPTS:
                 poll_attempt += 1
                 now = datetime.now()
-                log.info(f"Poll attempt {poll_attempt} at {now.strftime('%H:%M:%S.%f')[:-3]}...")
+                if poll_attempt <= 5 or poll_attempt % 30 == 0:
+                    log.info(f"Poll attempt {poll_attempt} at {now.strftime('%H:%M:%S.%f')[:-3]}...")
 
                 # Re-trigger date to refresh tee times without full reload
                 await js(f"""() => {{
@@ -640,11 +641,13 @@ async def main():
                     log.info("  No morning times yet...")
 
             if not quick_check:
-                log.error(f"No morning times appeared after {MAX_POLL_ATTEMPTS} poll attempts")
-                await screenshot("04_poll_exhausted")
-                sys.exit(1)
+                log.warning(f"No morning times appeared after {MAX_POLL_ATTEMPTS} poll attempts — falling back to best available time")
+                await screenshot("04_poll_exhausted_fallback")
 
-            log.info("Morning times are live! Proceeding to scrape and book...")
+            if quick_check:
+                log.info("Morning times are live! Proceeding to scrape and book...")
+            else:
+                log.info("Proceeding with best available time (fallback)...")
         else:
             log.info("Booking window already open, proceeding immediately")
 
@@ -815,8 +818,30 @@ async def main():
                 tee_times = raw_result
 
         if not tee_times:
-            log.error("No tee times found")
-            await page.screenshot(str(Path(__file__).parent / "debug_no_times.png"))
+            log.warning("No tee times found after retry — waiting 10s and trying once more...")
+            await asyncio.sleep(10)
+            # Re-trigger date to force refresh
+            await js(f"""() => {{
+                var input = document.querySelector('input#pickerDate, input[datepicker]');
+                if (input) {{
+                    input.value = '{target_date_str}';
+                    input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    try {{ angular.element(input).triggerHandler('change'); }} catch(e) {{}}
+                }}
+            }}""")
+            await asyncio.sleep(5)
+            raw_result = await js(SCRAPE_JS)
+            if isinstance(raw_result, str):
+                tee_times = json.loads(raw_result)
+            elif isinstance(raw_result, list):
+                tee_times = raw_result
+            else:
+                tee_times = raw_result
+
+        if not tee_times:
+            log.error("No tee times found after all retries")
+            await screenshot("debug_no_times")
             sys.exit(1)
 
         # Ensure tee_times is a list of dicts
@@ -837,7 +862,10 @@ async def main():
         best = await find_best_tee_time(tee_times, TARGET_TIME, NUM_PLAYERS)
 
         if not best:
-            log.error(f"No tee times with {NUM_PLAYERS} player slots")
+            log.warning(f"No tee times with {NUM_PLAYERS} player slots — trying with fewer players")
+            best = await find_best_tee_time(tee_times, TARGET_TIME, 1)
+        if not best:
+            log.error("No tee times found at all")
             sys.exit(1)
 
         target_mins = time_to_minutes(TARGET_TIME)
@@ -852,12 +880,12 @@ async def main():
         log.info("=" * 60)
 
         # ---------------------------------------------------------------
-        # BOOKING FLOW WITH RETRY (up to 10 attempts)
+        # BOOKING FLOW WITH RETRY (up to 30 attempts)
         # "Tee Time Adjustment" can appear at ANY step in the flow.
         # On snipe: dismiss dialog, pick next best time, restart flow.
         # ---------------------------------------------------------------
         tried_times = set()
-        MAX_ATTEMPTS = 10
+        MAX_ATTEMPTS = 30
         target_minutes = time_to_minutes(TARGET_TIME)
 
         async def wait_for_page_change(keyword, timeout=6):
@@ -994,7 +1022,7 @@ async def main():
             if not clicked:
                 log.warning(f"Could not match VIEW to '{best['time']}' — skipping to next best time")
                 if not await pick_next_best():
-                    sys.exit(1)
+                    break
                 continue
 
             log.info(f"VIEW clicked via '{clicked}'")
@@ -1007,7 +1035,7 @@ async def main():
                 sys.exit(0)
             if dialog_result:
                 if not await pick_next_best():
-                    sys.exit(1)
+                    break
                 continue
 
             # Step 7: Select Member Walk 18H
@@ -1121,7 +1149,7 @@ async def main():
                 sys.exit(0)
             if dialog_result:
                 if not await pick_next_best():
-                    sys.exit(1)
+                    break
                 continue
 
             # Check where we landed after Continue
@@ -1148,7 +1176,7 @@ async def main():
                 }""")
                 await asyncio.sleep(0.5)
                 if not await pick_next_best():
-                    sys.exit(1)
+                    break
                 continue
 
             if page_state.startswith('unknown'):
@@ -1166,7 +1194,7 @@ async def main():
             if not page_state.startswith('verify') and not page_state.startswith('finish'):
                 log.warning(f"Unexpected page state: {page_state} — skipping to next time")
                 if not await pick_next_best():
-                    sys.exit(1)
+                    break
                 continue
 
             # Step 8: Click CONTINUE on Verify Details page
@@ -1198,14 +1226,14 @@ async def main():
                 sys.exit(0)
             if dialog_result:
                 if not await pick_next_best():
-                    sys.exit(1)
+                    break
                 continue
 
             # Verify we actually reached the Finish page
             if "Finish" not in page_after_verify and "Pricing Options" in page_after_verify:
                 log.warning("Bounced back to Pricing Options after Verify Details Continue — retrying with next time")
                 if not await pick_next_best():
-                    sys.exit(1)
+                    break
                 continue
 
             # Step 9: Click Finish Reservation
@@ -1236,7 +1264,7 @@ async def main():
                     sys.exit(0)
                 if not await pick_next_best():
                     log.error("No more times to try — giving up")
-                    sys.exit(1)
+                    break
                 continue
 
             if DRY_RUN:
@@ -1303,7 +1331,7 @@ async def main():
                     }""")
                     await asyncio.sleep(1)
                     if not await pick_next_best():
-                        sys.exit(1)
+                        break
                     continue
                 else:
                     # Assume success if no error detected
