@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 debug_*.png
 *.log
+logs/
