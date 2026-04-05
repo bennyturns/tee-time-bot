@@ -570,14 +570,14 @@ async def main():
             // Check that the tee time count header has settled (not "0 tee times")
             var headerText = document.body.innerText.match(/(\d+)\s+tee time/i);
             var count = headerText ? parseInt(headerText[1]) : 0;
-            if (count < 1) return null;  // still loading
+            if (count < 3) return null;  // still loading
 
             // Check that VIEW buttons have actually rendered
             var viewBtns = Array.from(document.querySelectorAll('a, button, span, div, label'))
                 .filter(function(el) {
                     return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2 && el.offsetParent !== null;
                 });
-            return viewBtns.length >= 1 ? viewBtns.length : null;
+            return viewBtns.length >= 3 ? viewBtns.length : null;
         }""", timeout=20, desc="tee times fully loaded")
 
         # Final check — how many VIEW buttons do we have?
@@ -1457,12 +1457,13 @@ if __name__ == "__main__":
     import warnings
     warnings.filterwarnings("ignore", category=ResourceWarning, message="unclosed transport")
     # Suppress Windows asyncio pipe cleanup noise (ValueError during __del__)
-    _original_del = getattr(asyncio.proactor_events._ProactorBasePipeTransport, "__del__", None)
-    if _original_del:
-        def _silent_del(self):
-            try:
-                _original_del(self)
-            except (ValueError, OSError):
-                pass
-        asyncio.proactor_events._ProactorBasePipeTransport.__del__ = _silent_del
+    if sys.platform == "win32":
+        _original_del = getattr(asyncio.proactor_events._ProactorBasePipeTransport, "__del__", None)
+        if _original_del:
+            def _silent_del(self):
+                try:
+                    _original_del(self)
+                except (ValueError, OSError):
+                    pass
+            asyncio.proactor_events._ProactorBasePipeTransport.__del__ = _silent_del
     asyncio.run(main())
