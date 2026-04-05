@@ -46,16 +46,17 @@ POLL_LEAD_SECS = int(os.getenv("POLL_LEAD_SECS", "15"))  # Start polling this ma
 DRY_RUN = "--dry-run" in sys.argv
 DEBUG = "--debug" in sys.argv
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(Path(__file__).parent / "booking.log"),
-    ],
-)
+# Set up logging — dedicated handlers on our logger so browser-use can't override
+_log_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+_log_stdout = logging.StreamHandler(sys.stdout)
+_log_stdout.setFormatter(_log_fmt)
+_log_file = logging.FileHandler(Path(__file__).parent / "booking.log")
+_log_file.setFormatter(_log_fmt)
 log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+log.addHandler(_log_stdout)
+log.addHandler(_log_file)
+log.propagate = False  # Don't let root logger re-format our messages
 
 
 def time_to_minutes(time_str: str) -> int:
@@ -341,7 +342,7 @@ async def main():
     async def check_popup(label):
         """Check if the 'multiple tabs' popup is visible right now."""
         try:
-            popup_text = await js("""() => {
+            popup_text = await js(r"""() => {
                 var body = document.body ? document.body.innerText.substring(0, 3000) : '';
                 var checks = {
                     hasMultipleTabs: /multiple\s+tab/i.test(body),
@@ -565,23 +566,18 @@ async def main():
         # 1. Wait for loading spinner/overlay to disappear
         # 2. Wait for multiple VIEW buttons to render (not just 1)
         log.info("Waiting for tee times to finish loading...")
-        await wait_for(page, """() => {
-            // Check the page isn't in a loading state (greyed out / spinner)
-            var body = document.body;
-            var spinner = document.querySelector('.loading, .spinner, .fa-spinner, [class*="loading"]');
-            if (spinner && spinner.offsetParent !== null) return null;  // still loading
-
-            // Check that the tee time count header has settled (not "0 tee times" or very low)
-            var headerText = body.innerText.match(/(\\d+)\\s+tee time/i);
+        await wait_for(page, r"""() => {
+            // Check that the tee time count header has settled (not "0 tee times")
+            var headerText = document.body.innerText.match(/(\d+)\s+tee time/i);
             var count = headerText ? parseInt(headerText[1]) : 0;
-            if (count < 5) return null;  // still loading or throttled
+            if (count < 1) return null;  // still loading
 
             // Check that VIEW buttons have actually rendered
             var viewBtns = Array.from(document.querySelectorAll('a, button, span, div, label'))
                 .filter(function(el) {
                     return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2 && el.offsetParent !== null;
                 });
-            return viewBtns.length >= 3 ? viewBtns.length : null;
+            return viewBtns.length >= 1 ? viewBtns.length : null;
         }""", timeout=20, desc="tee times fully loaded")
 
         # Final check — how many VIEW buttons do we have?
@@ -1316,11 +1312,13 @@ async def main():
                 continue
 
             if DRY_RUN:
+                total_elapsed = asyncio.get_event_loop().time() - start_time
                 log.info("=" * 60)
                 log.info(f"DRY RUN — stopping before Finish Reservation")
                 log.info(f"Would book: {best['time']} on {target_day_str}")
                 log.info(f"Players: {NUM_PLAYERS}")
                 log.info(f"Final button found: '{has_finish}'")
+                log.info(f"Total elapsed time: {total_elapsed:.1f}s")
                 log.info("=" * 60)
                 await screenshot("09_dry_run_finish_page")
                 # Cancel to back out cleanly
@@ -1362,10 +1360,12 @@ async def main():
                 # Verify it actually worked (check for confirmation)
                 confirmation = await js("() => document.body.innerText.substring(0, 2000)")
                 if "Reservation Complete" in confirmation or "Confirmation" in confirmation:
+                    total_elapsed = asyncio.get_event_loop().time() - start_time
                     log.info("=" * 60)
                     log.info(f"BOOKING SUCCESSFUL!")
                     log.info(f"Time: {best['time']} on {target_day_str}")
                     log.info(f"Players: {NUM_PLAYERS}")
+                    log.info(f"Total elapsed time: {total_elapsed:.1f}s")
                     log.info("=" * 60)
                     log.info(f"Page content:\n{confirmation}")
                     break  # SUCCESS!
@@ -1383,9 +1383,11 @@ async def main():
                     continue
                 else:
                     # Assume success if no error detected
+                    total_elapsed = asyncio.get_event_loop().time() - start_time
                     log.info("=" * 60)
                     log.info(f"BOOKING FLOW COMPLETED!")
                     log.info(f"Time: {best['time']} on {target_day_str}")
+                    log.info(f"Total elapsed time: {total_elapsed:.1f}s")
                     log.info("=" * 60)
                     log.info(f"Page content:\n{confirmation}")
                     break
@@ -1407,4 +1409,13 @@ async def main():
 if __name__ == "__main__":
     import warnings
     warnings.filterwarnings("ignore", category=ResourceWarning, message="unclosed transport")
+    # Suppress Windows asyncio pipe cleanup noise (ValueError during __del__)
+    _original_del = getattr(asyncio.proactor_events._ProactorBasePipeTransport, "__del__", None)
+    if _original_del:
+        def _silent_del(self):
+            try:
+                _original_del(self)
+            except (ValueError, OSError):
+                pass
+        asyncio.proactor_events._ProactorBasePipeTransport.__del__ = _silent_del
     asyncio.run(main())
