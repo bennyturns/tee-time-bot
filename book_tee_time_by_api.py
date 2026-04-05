@@ -54,11 +54,19 @@ GROUP_ID = int(os.getenv("GROUP_ID", "27848"))
 DRY_RUN = "--dry-run" in sys.argv
 DEBUG = "--debug" in sys.argv
 
-# Set up logging
+# Set up logging — logs/ directory with daily rotation
+_log_dir = Path(__file__).parent / "logs"
+_log_dir.mkdir(exist_ok=True)
 _log_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 _log_stdout = logging.StreamHandler(sys.stdout)
 _log_stdout.setFormatter(_log_fmt)
-_log_file = logging.FileHandler(Path(__file__).parent / "booking_api.log")
+from logging.handlers import TimedRotatingFileHandler
+_log_file = TimedRotatingFileHandler(
+    _log_dir / "booking_api.log",
+    when="midnight",
+    backupCount=30,
+)
+_log_file.suffix = "%Y-%m-%d.log"      # rolled files: booking_api.log.2026-04-05.log
 _log_file.setFormatter(_log_fmt)
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
