@@ -556,6 +556,7 @@ async def main():
         # ---------------------------------------------------------------
         # WAIT FOR BOOKING WINDOW: Sit on page, then poll for new times
         # ---------------------------------------------------------------
+        POLL_TIMEOUT_SECONDS = 3600  # 60 minutes max polling
         now = datetime.now()
         drop_time = now.replace(hour=BOOKING_HOUR, minute=BOOKING_MINUTE, second=0, microsecond=0)
         poll_start = drop_time - timedelta(seconds=POLL_LEAD_SECS)
@@ -582,18 +583,20 @@ async def main():
             log.info("Starting rapid refresh polling for new tee times!")
 
         if now < drop_time:
-            # Poll by re-triggering the date (Angular refresh) until morning times appear
+            # Poll by re-triggering the date (Angular refresh) until VIEW buttons appear
+            # VIEW buttons = actual bookable tee time slots (avoids false positives from page chrome)
             # No full page reload — just nudge the date back and forth to refresh tee times
             target_minutes = time_to_minutes(TARGET_TIME)
             poll_attempt = 0
-            MAX_POLL_ATTEMPTS = 3600  # ~60 minutes at ~1s intervals
-            quick_check = None
+            poll_start = asyncio.get_event_loop().time()
+            view_count = 0
 
-            while poll_attempt < MAX_POLL_ATTEMPTS:
+            while (asyncio.get_event_loop().time() - poll_start) < POLL_TIMEOUT_SECONDS:
                 poll_attempt += 1
                 now = datetime.now()
                 if poll_attempt <= 5 or poll_attempt % 30 == 0:
-                    log.info(f"Poll attempt {poll_attempt} at {now.strftime('%H:%M:%S.%f')[:-3]}...")
+                    elapsed_poll = asyncio.get_event_loop().time() - poll_start
+                    log.info(f"Poll attempt {poll_attempt} at {now.strftime('%H:%M:%S.%f')[:-3]} ({elapsed_poll:.0f}s elapsed)...")
 
                 # Re-trigger date to refresh tee times without full reload
                 await js(f"""() => {{
@@ -625,29 +628,27 @@ async def main():
                 }}""")
                 await asyncio.sleep(1)
 
-                # Quick scrape — check if morning times exist
-                quick_check = await js("""() => {
-                    var body = document.body.innerText;
-                    var morningTimes = body.match(/\\b[5-9]:\\d{2}\\s*AM|\\b1[0-1]:\\d{2}\\s*AM/gi);
-                    return morningTimes ? morningTimes.join(',') : '';
+                # Check for actual bookable slots by counting VIEW buttons
+                view_count = await js("""() => {
+                    return Array.from(document.querySelectorAll('a, button, span, div, label'))
+                        .filter(function(el) {
+                            return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2;
+                        }).length;
                 }""")
 
-                if quick_check:
-                    log.info(f"Morning times detected: {quick_check}")
+                if view_count and view_count > 0:
+                    log.info(f"Found {view_count} VIEW buttons — tee times are live!")
                     await js("() => { window.scrollTo(0, 0); }")
                     await asyncio.sleep(0.5)
                     break
-                else:
-                    log.info("  No morning times yet...")
 
-            if not quick_check:
-                log.warning(f"No morning times appeared after {MAX_POLL_ATTEMPTS} poll attempts — falling back to best available time")
+            elapsed_poll = asyncio.get_event_loop().time() - poll_start
+            if not view_count or view_count == 0:
+                log.warning(f"No tee times appeared after {poll_attempt} poll attempts ({elapsed_poll:.0f}s) — falling back to best available time")
                 await screenshot("04_poll_exhausted_fallback")
-
-            if quick_check:
-                log.info("Morning times are live! Proceeding to scrape and book...")
-            else:
                 log.info("Proceeding with best available time (fallback)...")
+            else:
+                log.info(f"Tee times detected after {poll_attempt} polls ({elapsed_poll:.0f}s). Proceeding to scrape and book...")
         else:
             log.info("Booking window already open, proceeding immediately")
 
@@ -840,9 +841,55 @@ async def main():
                 tee_times = raw_result
 
         if not tee_times:
-            log.error("No tee times found after all retries")
-            await screenshot("debug_no_times")
-            sys.exit(1)
+            # Check if we still have time to keep trying
+            total_elapsed = asyncio.get_event_loop().time() - start_time
+            if total_elapsed < POLL_TIMEOUT_SECONDS:
+                log.warning(f"No tee times found after scrape retries — re-polling ({total_elapsed:.0f}s elapsed, {POLL_TIMEOUT_SECONDS - total_elapsed:.0f}s remaining)...")
+                await screenshot("debug_no_times_repoll")
+                # Re-enter a mini poll loop for remaining time
+                while (asyncio.get_event_loop().time() - start_time) < POLL_TIMEOUT_SECONDS:
+                    await js(f"""() => {{
+                        var input = document.querySelector('input#pickerDate, input[datepicker]');
+                        if (input) {{
+                            input.value = '';
+                            input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            try {{ angular.element(input).triggerHandler('change'); }} catch(e) {{}}
+                        }}
+                    }}""")
+                    await asyncio.sleep(0.3)
+                    await js(f"""() => {{
+                        var input = document.querySelector('input#pickerDate, input[datepicker]');
+                        if (input) {{
+                            input.value = '{target_date_str}';
+                            input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            try {{ angular.element(input).triggerHandler('change'); }} catch(e) {{}}
+                        }}
+                    }}""")
+                    await asyncio.sleep(2)
+                    vc = await js("""() => {
+                        return Array.from(document.querySelectorAll('a, button, span, div, label'))
+                            .filter(function(el) {
+                                return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2;
+                            }).length;
+                    }""")
+                    if vc and vc > 0:
+                        log.info(f"Re-poll found {vc} VIEW buttons! Re-scraping...")
+                        await asyncio.sleep(0.5)
+                        raw_result = await js(SCRAPE_JS)
+                        if isinstance(raw_result, str):
+                            tee_times = json.loads(raw_result)
+                        elif isinstance(raw_result, list):
+                            tee_times = raw_result
+                        if tee_times:
+                            break
+                        log.info("VIEW buttons present but scrape empty, continuing poll...")
+
+            if not tee_times:
+                log.error("No tee times found after all polling and retries")
+                await screenshot("debug_no_times_final")
+                sys.exit(1)
 
         # Ensure tee_times is a list of dicts
         if isinstance(tee_times, list) and tee_times and isinstance(tee_times[0], str):
