@@ -42,7 +42,7 @@ NUM_PLAYERS = int(os.getenv("NUM_PLAYERS", "4"))
 BOOKING_URL = os.getenv("BOOKING_URL", "https://lochmeregm.ezlinksgolf.com")
 DAYS_OUT = int(os.getenv("DAYS_OUT", "14"))
 BOOKING_HOUR = int(os.getenv("BOOKING_HOUR", "7"))  # Hour when new times drop
-BOOKING_MINUTE = int(os.getenv("BOOKING_MINUTE", "30"))  # Minute when new times drop
+BOOKING_MINUTE = int(os.getenv("BOOKING_MINUTE", "0"))  # Minute when new times drop
 POLL_LEAD_SECS = int(os.getenv("POLL_LEAD_SECS", "15"))  # Start polling before drop
 
 # Preferred rate type (SponsorID from HAR)
@@ -756,14 +756,15 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore", category=ResourceWarning, message="unclosed transport")
     warnings.filterwarnings("ignore", category=RuntimeWarning, message="coroutine.*was never awaited")
     # Suppress Windows asyncio pipe cleanup noise
-    _original_del = getattr(asyncio.proactor_events._ProactorBasePipeTransport, "__del__", None)
-    if _original_del:
-        def _silent_del(self):
-            try:
-                _original_del(self)
-            except (ValueError, OSError):
-                pass
-        asyncio.proactor_events._ProactorBasePipeTransport.__del__ = _silent_del
+    if sys.platform == "win32":
+        _original_del = getattr(asyncio.proactor_events._ProactorBasePipeTransport, "__del__", None)
+        if _original_del:
+            def _silent_del(self):
+                try:
+                    _original_del(self)
+                except (ValueError, OSError):
+                    pass
+            asyncio.proactor_events._ProactorBasePipeTransport.__del__ = _silent_del
     # Suppress browser-use cleanup chatter
     logging.getLogger("BrowserSession").setLevel(logging.CRITICAL)
     logging.getLogger("browser_use.browser.session").setLevel(logging.CRITICAL)
