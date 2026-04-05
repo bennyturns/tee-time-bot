@@ -146,7 +146,10 @@ async def main():
     start_time = asyncio.get_event_loop().time()
 
     # ---------------------------------------------------------------
-    # Phase 1: Use browser-use AI ONLY to pass Cloudflare
+    # Phase 1: Pass Cloudflare challenge
+    #   - Pre-navigate and wait so the checkbox shadow DOM renders
+    #   - Hand the agent a page that's ready to click (1-2 LLM steps)
+    #   - Verify with polling before entering Phase 2
     # ---------------------------------------------------------------
     log.info("Phase 1: Passing Cloudflare with AI agent...")
 
@@ -158,6 +161,7 @@ async def main():
     browser_profile = BrowserProfile(
         headless=False,
         disable_security=False,
+        window_size={"width": 1024, "height": 768},
         allowed_domains=[
             "lochmeregm.ezlinksgolf.com",
             "ezlinksgolf.com",
@@ -166,19 +170,31 @@ async def main():
     )
     browser_session = BrowserSession(browser_profile=browser_profile, keep_alive=True)
 
-    cloudflare_task = f"""
-    Go to {BOOKING_URL}
+    # Pre-navigate and wait so the agent doesn't waste steps on navigation
+    log.info("Pre-navigating and waiting for Cloudflare checkbox to render...")
+    await browser_session.start()
+    pre_page = await browser_session.get_current_page()
+    await pre_page.goto(BOOKING_URL)
+    await asyncio.sleep(10)  # Let shadow DOM expose the label element
+    log.info("Pre-navigation complete, handing off to AI agent...")
 
-    If you see a Cloudflare "Verify you are human" checkbox, click it and wait
-    for the page to load.
+    # Targeted prompt: click the LABEL, not the div[role=alert], then done immediately
+    cloudflare_task = """
+    You are on a page with a Cloudflare "Verify you are human" checkbox.
 
-    Once the tee time booking page loads (you see tee times, a date picker,
-    and player selection), your job is DONE. Report "CLOUDFLARE_PASSED" and stop.
+    On your VERY FIRST action, do BOTH of these together:
+      1. Click the LABEL element (checkbox-state attribute, text "Verify you are human").
+         Do NOT click the div with role=alert — only the label works.
+      2. Call done("CLOUDFLARE_PASSED").
 
-    Do NOT interact with any booking elements. Just pass Cloudflare and stop.
+    If the booking page is already loaded (date picker, tee times), call done immediately.
+
+    Do NOT wait. Do NOT use JavaScript. Do NOT take extra steps.
     """
 
     MAX_CF_RETRIES = 3
+    CF_POLL_TIMEOUT = 20  # seconds to wait for page transition after agent
+    CF_POLL_INTERVAL = 2
     cf_passed = False
 
     for cf_attempt in range(1, MAX_CF_RETRIES + 1):
@@ -189,44 +205,71 @@ async def main():
             llm=llm,
             use_vision=True,
             browser_session=browser_session,
-            max_failures=3,
+            max_failures=2,
             max_actions_per_step=2,
+            flash_mode=True,
+            use_judge=False,
         )
         result = await agent.run()
 
         elapsed = asyncio.get_event_loop().time() - start_time
         log.info(f"[{elapsed:.1f}s] Agent attempt {cf_attempt} finished")
 
-        # Verify Cloudflare is actually passed (agent sometimes reports false success)
+        # --- Verify: poll the page to confirm Cloudflare is gone ---
         page_check = await browser_session.get_current_page()
         if not page_check:
             log.error("Could not get page for Cloudflare verification")
             sys.exit(1)
 
-        for poll_s in range(0, 20, 2):
+        poll_elapsed = 0.0
+        while poll_elapsed < CF_POLL_TIMEOUT:
             cf_check = await page_check.evaluate("""() => {
                 var body = document.body ? document.body.innerText : '';
+                var url = window.location.href;
                 var hasChallenge = body.includes('Verify you are human') ||
                                   body.includes('Just a moment') ||
-                                  body.includes('security verification');
+                                  body.includes('security verification') ||
+                                  body.includes('security service') ||
+                                  body.includes('malicious bots') ||
+                                  body.includes('not a bot') ||
+                                  url.includes('challenges.cloudflare.com') ||
+                                  !!document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                var isTransitioning = (body.includes('Verifying') && !body.includes('security verification')) ||
+                                     body.trim().length < 50;
                 var hasBookingContent = body.includes('Sign In') ||
                                        body.includes('Tee Times') ||
+                                       body.includes('Book') ||
                                        body.includes('Player');
-                return JSON.stringify({hasChallenge: hasChallenge, hasBookingContent: hasBookingContent});
+                return JSON.stringify({
+                    hasChallenge: hasChallenge,
+                    isTransitioning: isTransitioning,
+                    hasBookingContent: hasBookingContent,
+                    url: url,
+                    bodyPreview: body.substring(0, 300)
+                });
             }""")
+            log.info(f"  Verify poll +{poll_elapsed:.0f}s: {cf_check}")
+
             cf_status = json.loads(cf_check) if isinstance(cf_check, str) else cf_check
+
             if not cf_status.get("hasChallenge") and cf_status.get("hasBookingContent"):
                 log.info("Cloudflare passed — booking page confirmed.")
                 cf_passed = True
                 break
-            if cf_status.get("hasChallenge"):
-                log.info(f"  Verify poll +{poll_s}s: challenge still active")
+
+            # Active challenge, not transitioning — stop polling, retry agent
+            if cf_status.get("hasChallenge") and not cf_status.get("isTransitioning"):
+                log.info("Challenge still active — will retry agent.")
                 break
-            log.info(f"  Verify poll +{poll_s}s: page transitioning...")
-            await asyncio.sleep(2)
+
+            # Transitional state — keep waiting
+            log.info("  Page transitioning...")
+            await asyncio.sleep(CF_POLL_INTERVAL)
+            poll_elapsed += CF_POLL_INTERVAL
 
         if cf_passed:
             break
+
         if cf_attempt >= MAX_CF_RETRIES:
             log.error(f"Cloudflare not passed after {MAX_CF_RETRIES} attempts. Aborting.")
             sys.exit(1)
