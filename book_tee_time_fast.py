@@ -640,7 +640,25 @@ async def main():
                 now = datetime.now()
                 if poll_attempt <= 5 or poll_attempt % 30 == 0:
                     elapsed_poll = asyncio.get_event_loop().time() - poll_start
-                    log.info(f"Poll attempt {poll_attempt} at {now.strftime('%H:%M:%S.%f')[:-3]} ({elapsed_poll:.0f}s elapsed)...")
+                    # Diagnostic: log what the page is actually showing
+                    try:
+                        page_state = await js("""() => {
+                            var body = document.body.innerText;
+                            var dateMatch = body.match(/(\\d{2}\\/\\d{2}\\/\\d{4})/);
+                            var countMatch = body.match(/(\\d+)\\s+tee time/i);
+                            var viewBtns = Array.from(document.querySelectorAll('a, button, span, div, label'))
+                                .filter(function(el) {
+                                    return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2;
+                                }).length;
+                            return JSON.stringify({
+                                pageDate: dateMatch ? dateMatch[1] : '?',
+                                teeTimeCount: countMatch ? countMatch[1] : '0',
+                                viewButtons: viewBtns
+                            });
+                        }""")
+                        log.info(f"Poll attempt {poll_attempt} at {now.strftime('%H:%M:%S.%f')[:-3]} ({elapsed_poll:.0f}s elapsed) — page: {page_state}")
+                    except Exception:
+                        log.info(f"Poll attempt {poll_attempt} at {now.strftime('%H:%M:%S.%f')[:-3]} ({elapsed_poll:.0f}s elapsed)...")
 
                 # Re-trigger date to refresh tee times without full reload
                 await js(f"""() => {{
@@ -673,14 +691,19 @@ async def main():
                 await asyncio.sleep(1)
 
                 # Check for actual bookable slots by counting VIEW buttons
-                view_count = await js("""() => {
-                    return Array.from(document.querySelectorAll('a, button, span, div, label'))
-                        .filter(function(el) {
-                            return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2;
-                        }).length;
-                }""")
+                try:
+                    view_count = await js("""() => {
+                        return Array.from(document.querySelectorAll('a, button, span, div, label'))
+                            .filter(function(el) {
+                                return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2;
+                            }).length;
+                    }""")
+                    view_count = int(view_count) if view_count is not None else 0
+                except Exception as e:
+                    log.warning(f"Poll {poll_attempt} VIEW count failed ({e}), retrying...")
+                    view_count = 0
 
-                if view_count and view_count > 0:
+                if view_count > 0:
                     log.info(f"Found {view_count} VIEW buttons — tee times are live!")
                     await js("() => { window.scrollTo(0, 0); }")
                     await asyncio.sleep(0.5)
