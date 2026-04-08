@@ -384,6 +384,38 @@ async def main():
     await check_popup("after_cloudflare")
 
     try:
+        # ---------------------------------------------------------------
+        # WAIT BEFORE LOGIN: Delay login until close to drop time to avoid
+        # session expiry. The site may reset sessions at drop time.
+        # Login + configure takes ~10s, so start 25s before drop.
+        # ---------------------------------------------------------------
+        POLL_TIMEOUT_SECONDS = 3600  # 60 minutes max polling
+        LOGIN_LEAD_SECS = 25  # start login this many seconds before drop
+        now = datetime.now()
+        drop_time = now.replace(hour=BOOKING_HOUR, minute=BOOKING_MINUTE, second=0, microsecond=0)
+        login_start = drop_time - timedelta(seconds=LOGIN_LEAD_SECS)
+
+        if now < login_start:
+            wait_secs = (login_start - now).total_seconds()
+            log.info(f"Cloudflare passed. Waiting {wait_secs:.0f}s until {login_start.strftime('%H:%M:%S')} to login (avoiding early session expiry)...")
+            log.info(f"Drop time: {drop_time.strftime('%H:%M:%S')}, login starts {LOGIN_LEAD_SECS}s early")
+            while True:
+                now = datetime.now()
+                remaining = (login_start - now).total_seconds()
+                if remaining <= 0:
+                    break
+                if remaining <= 10:
+                    log.info(f"  {remaining:.1f}s until login...")
+                elif remaining <= 60:
+                    if int(remaining) % 10 == 0:
+                        log.info(f"  {remaining:.0f}s until login...")
+                else:
+                    if int(remaining) % 30 == 0:
+                        log.info(f"  {remaining:.0f}s until login...")
+                await asyncio.sleep(min(1.0, remaining))
+
+            log.info("Starting login + configuration!")
+
         # Step 1: Sign in
         log.info("Signing in...")
         await screenshot("01_before_signin")
@@ -598,33 +630,10 @@ async def main():
         await js("() => { window.scrollTo(0, 0); }")
 
         # ---------------------------------------------------------------
-        # WAIT FOR BOOKING WINDOW: Sit on page, then poll for new times
+        # POLL FOR NEW TEE TIMES: Start immediately after login/configure
         # ---------------------------------------------------------------
-        POLL_TIMEOUT_SECONDS = 3600  # 60 minutes max polling
-        now = datetime.now()
-        drop_time = now.replace(hour=BOOKING_HOUR, minute=BOOKING_MINUTE, second=0, microsecond=0)
-        poll_start = drop_time - timedelta(seconds=POLL_LEAD_SECS)
-
-        if now < poll_start:
-            wait_secs = (poll_start - now).total_seconds()
-            log.info(f"Pre-positioned! Waiting {wait_secs:.0f}s until {poll_start.strftime('%H:%M:%S')} to start polling...")
-            log.info(f"Drop time: {drop_time.strftime('%H:%M:%S')}, polling starts {POLL_LEAD_SECS}s early")
-            while True:
-                now = datetime.now()
-                remaining = (poll_start - now).total_seconds()
-                if remaining <= 0:
-                    break
-                if remaining <= 10:
-                    log.info(f"  {remaining:.1f}s until polling starts...")
-                elif remaining <= 60:
-                    if int(remaining) % 10 == 0:
-                        log.info(f"  {remaining:.0f}s until polling starts...")
-                else:
-                    if int(remaining) % 30 == 0:
-                        log.info(f"  {remaining:.0f}s until polling starts...")
-                await asyncio.sleep(min(1.0, remaining))
-
-            log.info("Starting rapid refresh polling for new tee times!")
+        now = datetime.now()  # refresh after login delay
+        log.info("Starting rapid refresh polling for new tee times!")
 
         if now < drop_time:
             # Poll by re-triggering the date (Angular refresh) until VIEW buttons appear
@@ -634,6 +643,166 @@ async def main():
             poll_attempt = 0
             poll_start = asyncio.get_event_loop().time()
             view_count = 0
+            stale_count = 0  # consecutive polls with no page data
+            STALE_THRESHOLD = 10  # trigger recovery after this many dead polls
+            MAX_RECOVERIES = 3  # don't loop forever
+
+            async def recover_page():
+                """Full page reload + re-login + re-configure when page goes stale."""
+                log.warning("Page appears stale — initiating full page recovery...")
+                await screenshot("recovery_before_reload")
+
+                # Step 1: Full page reload (Cloudflare cookie should persist)
+                log.info("Recovery: reloading page...")
+                await js(f"() => {{ window.location.href = '{BOOKING_URL}'; }}")
+                await asyncio.sleep(10)  # wait for Cloudflare + page load
+
+                # Step 2: Check if we landed on booking page or Cloudflare
+                recovery_check = await js("""() => {
+                    var body = document.body ? document.body.innerText : '';
+                    return JSON.stringify({
+                        hasChallenge: body.includes('Verify you are human') || body.includes('Just a moment'),
+                        hasBooking: body.includes('Sign In') || body.includes('Tee Times') || body.includes('My Account'),
+                        bodyPreview: body.substring(0, 200)
+                    });
+                }""")
+                log.info(f"Recovery: page state after reload: {recovery_check}")
+                rc = json.loads(recovery_check) if isinstance(recovery_check, str) else recovery_check
+
+                if rc.get('hasChallenge'):
+                    log.error("Recovery: Cloudflare challenge appeared — cookie expired. Cannot recover.")
+                    return False
+
+                # Step 3: Re-login
+                log.info("Recovery: signing in...")
+                await js("""() => {
+                    var signIn = Array.from(document.querySelectorAll('a, button, span'))
+                        .find(el => el.textContent.trim() === 'Sign In');
+                    if (signIn) signIn.click();
+                }""")
+                await asyncio.sleep(2)
+
+                await js(f"""() => {{
+                    var userField = document.querySelector("input[name='username'], input[type='email'], input[id*='user'], input[id*='email'], input[name='email'], input[type='text']");
+                    if (userField) {{
+                        userField.focus();
+                        userField.value = '{EZLINKS_USERNAME}';
+                        userField.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        userField.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    }}
+                }}""")
+                await asyncio.sleep(0.3)
+
+                await js(f"""() => {{
+                    var passField = document.querySelector("input[type='password']");
+                    if (passField) {{
+                        passField.focus();
+                        passField.value = '{EZLINKS_PASSWORD}';
+                        passField.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        passField.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    }}
+                }}""")
+                await asyncio.sleep(0.3)
+
+                await js("""() => {
+                    var btn = document.querySelector("button[type='submit'], input[type='submit']");
+                    if (!btn) {
+                        btn = Array.from(document.querySelectorAll('button, a'))
+                            .find(el => el.textContent.trim().match(/sign in|log in|submit/i));
+                    }
+                    if (btn) btn.click();
+                }""")
+                await asyncio.sleep(3)
+
+                login_check = await js("""() => {
+                    var body = document.body.innerText;
+                    if (body.includes('Sign Out') || body.includes('Log Out') || body.includes('My Account') || body.includes('Welcome')) {
+                        return 'LOGGED_IN';
+                    }
+                    return 'FAILED';
+                }""")
+                log.info(f"Recovery: login status: {login_check}")
+                if login_check != 'LOGGED_IN':
+                    log.error("Recovery: login failed after reload")
+                    return False
+
+                # Step 4: Set date
+                log.info(f"Recovery: setting date to {target_date_str}...")
+                await js(f"""() => {{
+                    var input = document.querySelector('input#pickerDate, input[datepicker]');
+                    if (input) {{
+                        input.value = '{target_date_str}';
+                        input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        try {{ angular.element(input).triggerHandler('change'); }} catch(e) {{}}
+                    }}
+                    var cells = document.querySelectorAll('.ui-state-default');
+                    for (var cell of cells) {{
+                        if (cell.textContent.trim() === '{target_day}') {{
+                            cell.click();
+                            break;
+                        }}
+                    }}
+                }}""")
+                await asyncio.sleep(2)
+
+                # Step 5: Set players
+                log.info(f"Recovery: setting players to {NUM_PLAYERS}...")
+                await js(f"""() => {{
+                    var btn = document.querySelector('button#players-button');
+                    if (!btn) {{
+                        btn = Array.from(document.querySelectorAll('button'))
+                            .find(function(b) {{ return b.id && b.id.includes('player'); }});
+                    }}
+                    if (btn) btn.click();
+                }}""")
+                await asyncio.sleep(0.5)
+                await js(f"""() => {{
+                    var links = document.querySelectorAll('ul.dropdown-menu a, li a');
+                    for (var link of links) {{
+                        if (link.textContent.trim() === '{NUM_PLAYERS}') {{
+                            link.click();
+                            return true;
+                        }}
+                    }}
+                    return false;
+                }}""")
+                await asyncio.sleep(1)
+
+                # Step 6: Select pricing
+                log.info("Recovery: selecting Member Walk 18H...")
+                await js("""() => {
+                    var labels = document.querySelectorAll('label, span, a, div, button');
+                    for (var el of labels) {
+                        if (el.textContent.trim() === 'Member Walk 18H') {
+                            el.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                await asyncio.sleep(2)
+
+                # Verify recovery worked
+                verify = await js("""() => {
+                    var body = document.body.innerText;
+                    var dateMatch = body.match(/(\\d{2}\\/\\d{2}\\/\\d{4})/);
+                    var countMatch = body.match(/(\\d+)\\s+tee time/i);
+                    var viewBtns = Array.from(document.querySelectorAll('a, button, span, div, label'))
+                        .filter(function(el) {
+                            return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2;
+                        }).length;
+                    return JSON.stringify({
+                        pageDate: dateMatch ? dateMatch[1] : '?',
+                        teeTimeCount: countMatch ? countMatch[1] : '0',
+                        viewButtons: viewBtns
+                    });
+                }""")
+                log.info(f"Recovery: page state after setup: {verify}")
+                await screenshot("recovery_after_setup")
+                return True
+
+            recoveries_done = 0
 
             while (asyncio.get_event_loop().time() - poll_start) < POLL_TIMEOUT_SECONDS:
                 poll_attempt += 1
@@ -657,8 +826,32 @@ async def main():
                             });
                         }""")
                         log.info(f"Poll attempt {poll_attempt} at {now.strftime('%H:%M:%S.%f')[:-3]} ({elapsed_poll:.0f}s elapsed) — page: {page_state}")
+
+                        # Check for stale page
+                        try:
+                            ps = json.loads(page_state) if isinstance(page_state, str) else page_state
+                            if ps.get('pageDate') == '?' and int(ps.get('viewButtons', 0)) == 0:
+                                stale_count += 1
+                            else:
+                                stale_count = 0
+                        except Exception:
+                            stale_count += 1
+
                     except Exception:
                         log.info(f"Poll attempt {poll_attempt} at {now.strftime('%H:%M:%S.%f')[:-3]} ({elapsed_poll:.0f}s elapsed)...")
+                        stale_count += 1
+
+                # Stale page recovery
+                if stale_count >= STALE_THRESHOLD and recoveries_done < MAX_RECOVERIES:
+                    recoveries_done += 1
+                    log.warning(f"Stale page detected ({stale_count} consecutive dead polls) — recovery attempt {recoveries_done}/{MAX_RECOVERIES}")
+                    recovered = await recover_page()
+                    stale_count = 0
+                    if not recovered:
+                        log.error("Recovery failed — continuing polling with degraded page")
+                    else:
+                        log.info("Recovery successful — resuming polling")
+                    continue
 
                 # Re-trigger date to refresh tee times without full reload
                 await js(f"""() => {{
