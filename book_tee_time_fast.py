@@ -636,98 +636,81 @@ async def main():
         log.info("Starting rapid refresh polling for new tee times!")
 
         if now < drop_time:
-            # Poll by re-triggering the date (Angular refresh) until VIEW buttons appear
-            # VIEW buttons = actual bookable tee time slots (avoids false positives from page chrome)
-            # No full page reload — just nudge the date back and forth to refresh tee times
+            # Poll via full page reload each cycle. The old date-nudge approach
+            # was destroying Angular page state. A full reload is slower (~15s/cycle)
+            # but each attempt starts from a known-good state.
             target_minutes = time_to_minutes(TARGET_TIME)
             poll_attempt = 0
             poll_start = asyncio.get_event_loop().time()
             view_count = 0
-            stale_count = 0  # consecutive polls with no page data
-            STALE_THRESHOLD = 10  # trigger recovery after this many dead polls
-            MAX_RECOVERIES = 3  # don't loop forever
 
-            async def recover_page():
-                """Full page reload + re-login + re-configure when page goes stale."""
-                log.warning("Page appears stale — initiating full page recovery...")
-                await screenshot("recovery_before_reload")
+            async def reload_and_configure():
+                """Reload page, re-login if needed, set date/players/pricing.
+                Returns the VIEW button count, or -1 if Cloudflare blocked us."""
 
-                # Step 1: Full page reload (Cloudflare cookie should persist)
-                log.info("Recovery: reloading page...")
+                # Reload the page (Cloudflare cookie should persist)
                 await js(f"() => {{ window.location.href = '{BOOKING_URL}'; }}")
-                await asyncio.sleep(10)  # wait for Cloudflare + page load
+                await asyncio.sleep(5)
 
-                # Step 2: Check if we landed on booking page or Cloudflare
-                recovery_check = await js("""() => {
+                # Check if we landed on booking page or Cloudflare
+                page_check = await js("""() => {
                     var body = document.body ? document.body.innerText : '';
                     return JSON.stringify({
                         hasChallenge: body.includes('Verify you are human') || body.includes('Just a moment'),
-                        hasBooking: body.includes('Sign In') || body.includes('Tee Times') || body.includes('My Account'),
+                        hasMyAccount: body.includes('My Account'),
+                        hasSignIn: body.includes('Sign In'),
                         bodyPreview: body.substring(0, 200)
                     });
                 }""")
-                log.info(f"Recovery: page state after reload: {recovery_check}")
-                rc = json.loads(recovery_check) if isinstance(recovery_check, str) else recovery_check
+                pc = json.loads(page_check) if isinstance(page_check, str) else page_check
 
-                if rc.get('hasChallenge'):
-                    log.error("Recovery: Cloudflare challenge appeared — cookie expired. Cannot recover.")
-                    return False
+                if pc.get('hasChallenge'):
+                    log.error("Cloudflare challenge after reload — cookie expired")
+                    return -1
 
-                # Step 3: Re-login
-                log.info("Recovery: signing in...")
-                await js("""() => {
-                    var signIn = Array.from(document.querySelectorAll('a, button, span'))
-                        .find(el => el.textContent.trim() === 'Sign In');
-                    if (signIn) signIn.click();
-                }""")
-                await asyncio.sleep(2)
+                # Re-login if not already logged in
+                if not pc.get('hasMyAccount'):
+                    log.info("  Re-logging in...")
+                    await js("""() => {
+                        var signIn = Array.from(document.querySelectorAll('a, button, span'))
+                            .find(el => el.textContent.trim() === 'Sign In');
+                        if (signIn) signIn.click();
+                    }""")
+                    await asyncio.sleep(2)
 
-                await js(f"""() => {{
-                    var userField = document.querySelector("input[name='username'], input[type='email'], input[id*='user'], input[id*='email'], input[name='email'], input[type='text']");
-                    if (userField) {{
-                        userField.focus();
-                        userField.value = '{EZLINKS_USERNAME}';
-                        userField.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        userField.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    }}
-                }}""")
-                await asyncio.sleep(0.3)
+                    await js(f"""() => {{
+                        var userField = document.querySelector("input[name='username'], input[type='email'], input[id*='user'], input[id*='email'], input[name='email'], input[type='text']");
+                        if (userField) {{
+                            userField.focus();
+                            userField.value = '{EZLINKS_USERNAME}';
+                            userField.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            userField.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        }}
+                    }}""")
+                    await asyncio.sleep(0.3)
 
-                await js(f"""() => {{
-                    var passField = document.querySelector("input[type='password']");
-                    if (passField) {{
-                        passField.focus();
-                        passField.value = '{EZLINKS_PASSWORD}';
-                        passField.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        passField.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    }}
-                }}""")
-                await asyncio.sleep(0.3)
+                    await js(f"""() => {{
+                        var passField = document.querySelector("input[type='password']");
+                        if (passField) {{
+                            passField.focus();
+                            passField.value = '{EZLINKS_PASSWORD}';
+                            passField.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            passField.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        }}
+                    }}""")
+                    await asyncio.sleep(0.3)
 
-                await js("""() => {
-                    var btn = document.querySelector("button[type='submit'], input[type='submit']");
-                    if (!btn) {
-                        btn = Array.from(document.querySelectorAll('button, a'))
-                            .find(el => el.textContent.trim().match(/sign in|log in|submit/i));
-                    }
-                    if (btn) btn.click();
-                }""")
-                await asyncio.sleep(3)
+                    await js("""() => {
+                        var btn = document.querySelector("button[type='submit'], input[type='submit']");
+                        if (!btn) {
+                            btn = Array.from(document.querySelectorAll('button, a'))
+                                .find(el => el.textContent.trim().match(/sign in|log in|submit/i));
+                        }
+                        if (btn) btn.click();
+                    }""")
+                    await asyncio.sleep(3)
 
-                login_check = await js("""() => {
-                    var body = document.body.innerText;
-                    if (body.includes('Sign Out') || body.includes('Log Out') || body.includes('My Account') || body.includes('Welcome')) {
-                        return 'LOGGED_IN';
-                    }
-                    return 'FAILED';
-                }""")
-                log.info(f"Recovery: login status: {login_check}")
-                if login_check != 'LOGGED_IN':
-                    log.error("Recovery: login failed after reload")
-                    return False
-
-                # Step 4: Set date
-                log.info(f"Recovery: setting date to {target_date_str}...")
+                # Set date
                 await js(f"""() => {{
                     var input = document.querySelector('input#pickerDate, input[datepicker]');
                     if (input) {{
@@ -746,8 +729,7 @@ async def main():
                 }}""")
                 await asyncio.sleep(2)
 
-                # Step 5: Set players
-                log.info(f"Recovery: setting players to {NUM_PLAYERS}...")
+                # Set players
                 await js(f"""() => {{
                     var btn = document.querySelector('button#players-button');
                     if (!btn) {{
@@ -769,8 +751,7 @@ async def main():
                 }}""")
                 await asyncio.sleep(1)
 
-                # Step 6: Select pricing
-                log.info("Recovery: selecting Member Walk 18H...")
+                # Select pricing
                 await js("""() => {
                     var labels = document.querySelectorAll('label, span, a, div, button');
                     for (var el of labels) {
@@ -783,118 +764,45 @@ async def main():
                 }""")
                 await asyncio.sleep(2)
 
-                # Verify recovery worked
-                verify = await js("""() => {
-                    var body = document.body.innerText;
-                    var dateMatch = body.match(/(\\d{2}\\/\\d{2}\\/\\d{4})/);
-                    var countMatch = body.match(/(\\d+)\\s+tee time/i);
-                    var viewBtns = Array.from(document.querySelectorAll('a, button, span, div, label'))
-                        .filter(function(el) {
-                            return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2;
-                        }).length;
-                    return JSON.stringify({
-                        pageDate: dateMatch ? dateMatch[1] : '?',
-                        teeTimeCount: countMatch ? countMatch[1] : '0',
-                        viewButtons: viewBtns
-                    });
-                }""")
-                log.info(f"Recovery: page state after setup: {verify}")
-                await screenshot("recovery_after_setup")
-                return True
-
-            recoveries_done = 0
+                # Check page state
+                try:
+                    result = await js("""() => {
+                        var body = document.body.innerText;
+                        var dateMatch = body.match(/(\\d{2}\\/\\d{2}\\/\\d{4})/);
+                        var countMatch = body.match(/(\\d+)\\s+tee time/i);
+                        var viewBtns = Array.from(document.querySelectorAll('a, button, span, div, label'))
+                            .filter(function(el) {
+                                return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2;
+                            }).length;
+                        return JSON.stringify({
+                            pageDate: dateMatch ? dateMatch[1] : '?',
+                            teeTimeCount: countMatch ? countMatch[1] : '0',
+                            viewButtons: viewBtns
+                        });
+                    }""")
+                    ps = json.loads(result) if isinstance(result, str) else result
+                    return int(ps.get('viewButtons', 0))
+                except Exception as e:
+                    log.warning(f"  Page state check failed: {e}")
+                    return 0
 
             while (asyncio.get_event_loop().time() - poll_start) < POLL_TIMEOUT_SECONDS:
                 poll_attempt += 1
                 now = datetime.now()
-                if poll_attempt <= 5 or poll_attempt % 30 == 0:
-                    elapsed_poll = asyncio.get_event_loop().time() - poll_start
-                    # Diagnostic: log what the page is actually showing
-                    try:
-                        page_state = await js("""() => {
-                            var body = document.body.innerText;
-                            var dateMatch = body.match(/(\\d{2}\\/\\d{2}\\/\\d{4})/);
-                            var countMatch = body.match(/(\\d+)\\s+tee time/i);
-                            var viewBtns = Array.from(document.querySelectorAll('a, button, span, div, label'))
-                                .filter(function(el) {
-                                    return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2;
-                                }).length;
-                            return JSON.stringify({
-                                pageDate: dateMatch ? dateMatch[1] : '?',
-                                teeTimeCount: countMatch ? countMatch[1] : '0',
-                                viewButtons: viewBtns
-                            });
-                        }""")
-                        log.info(f"Poll attempt {poll_attempt} at {now.strftime('%H:%M:%S.%f')[:-3]} ({elapsed_poll:.0f}s elapsed) — page: {page_state}")
+                elapsed_poll = asyncio.get_event_loop().time() - poll_start
+                log.info(f"Poll {poll_attempt} at {now.strftime('%H:%M:%S')} ({elapsed_poll:.0f}s elapsed) — reloading page...")
 
-                        # Check for stale page
-                        try:
-                            ps = json.loads(page_state) if isinstance(page_state, str) else page_state
-                            if ps.get('pageDate') == '?' and int(ps.get('viewButtons', 0)) == 0:
-                                stale_count += 1
-                            else:
-                                stale_count = 0
-                        except Exception:
-                            stale_count += 1
-
-                    except Exception:
-                        log.info(f"Poll attempt {poll_attempt} at {now.strftime('%H:%M:%S.%f')[:-3]} ({elapsed_poll:.0f}s elapsed)...")
-                        stale_count += 1
-
-                # Stale page recovery
-                if stale_count >= STALE_THRESHOLD and recoveries_done < MAX_RECOVERIES:
-                    recoveries_done += 1
-                    log.warning(f"Stale page detected ({stale_count} consecutive dead polls) — recovery attempt {recoveries_done}/{MAX_RECOVERIES}")
-                    recovered = await recover_page()
-                    stale_count = 0
-                    if not recovered:
-                        log.error("Recovery failed — continuing polling with degraded page")
-                    else:
-                        log.info("Recovery successful — resuming polling")
-                    continue
-
-                # Re-trigger date to refresh tee times without full reload
-                await js(f"""() => {{
-                    var input = document.querySelector('input#pickerDate, input[datepicker]');
-                    if (input) {{
-                        // Nudge to different date then back to force Angular refresh
-                        input.value = '';
-                        input.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        input.dispatchEvent(new Event('change', {{bubbles: true}}));
-                        try {{ angular.element(input).triggerHandler('change'); }} catch(e) {{}}
-                    }}
-                }}""")
-                await asyncio.sleep(0.3)
-                await js(f"""() => {{
-                    var input = document.querySelector('input#pickerDate, input[datepicker]');
-                    if (input) {{
-                        input.value = '{target_date_str}';
-                        input.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        input.dispatchEvent(new Event('change', {{bubbles: true}}));
-                        try {{ angular.element(input).triggerHandler('change'); }} catch(e) {{}}
-                    }}
-                    var cells = document.querySelectorAll('.ui-state-default');
-                    for (var cell of cells) {{
-                        if (cell.textContent.trim() === '{target_day}') {{
-                            cell.click();
-                            break;
-                        }}
-                    }}
-                }}""")
-                await asyncio.sleep(1)
-
-                # Check for actual bookable slots by counting VIEW buttons
                 try:
-                    view_count = await js("""() => {
-                        return Array.from(document.querySelectorAll('a, button, span, div, label'))
-                            .filter(function(el) {
-                                return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2;
-                            }).length;
-                    }""")
-                    view_count = int(view_count) if view_count is not None else 0
+                    view_count = await reload_and_configure()
                 except Exception as e:
-                    log.warning(f"Poll {poll_attempt} VIEW count failed ({e}), retrying...")
+                    log.warning(f"Poll {poll_attempt} failed ({e}), retrying...")
                     view_count = 0
+
+                if view_count == -1:
+                    log.error("Cloudflare blocked us — cannot continue polling")
+                    break
+
+                log.info(f"  Poll {poll_attempt} result: {view_count} VIEW buttons")
 
                 if view_count > 0:
                     log.info(f"Found {view_count} VIEW buttons — tee times are live!")
