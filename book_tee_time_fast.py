@@ -1394,7 +1394,85 @@ async def main():
                     break
                 continue
 
-            if page_state.startswith('unknown'):
+            if page_state.startswith('unknown') and 'CHOOSE OPTION' in page_state.upper():
+                # Still on the CHOOSE OPTIONS step — the pricing selection or
+                # Continue didn't register. Log the full modal state, re-select
+                # pricing, and try Continue again.
+                log.warning("Still on CHOOSE OPTIONS page — retrying selection...")
+
+                # Dump what's visible for debugging
+                modal_dump = await js("""() => {
+                    var body = document.body.innerText.substring(0, 1000);
+                    var buttons = Array.from(document.querySelectorAll('button, a, input[type="submit"]'))
+                        .filter(b => b.offsetParent !== null)
+                        .map(b => b.textContent.trim()).filter(t => t.length > 0 && t.length < 50);
+                    var selects = Array.from(document.querySelectorAll('select'))
+                        .map(s => ({id: s.id, value: s.value, options: Array.from(s.options).map(o => o.text.trim())}));
+                    var clickables = Array.from(document.querySelectorAll('[ng-click], [data-ng-click]'))
+                        .filter(el => el.offsetParent !== null)
+                        .map(el => el.textContent.trim().substring(0, 60))
+                        .filter(t => t.length > 0);
+                    return JSON.stringify({buttons: buttons.slice(0, 15), selects: selects, clickables: clickables.slice(0, 15), bodyPreview: body});
+                }""")
+                log.info(f"CHOOSE OPTIONS page state: {modal_dump}")
+
+                # Re-select Member Walk 18H
+                await js("""() => {
+                    // Try clicking any element containing 'Member Walk 18H'
+                    var allEls = document.querySelectorAll('[ng-click], [data-ng-click], a, button, label, tr, li, div, span');
+                    for (var el of allEls) {
+                        var text = el.textContent.trim();
+                        if (text.includes('Member Walk 18H') && text.length < 100 && el.offsetParent !== null) {
+                            el.click();
+                            return 'clicked: ' + text.substring(0, 60);
+                        }
+                    }
+                    return 'not_found';
+                }""")
+                await asyncio.sleep(1)
+
+                # Re-set players
+                await js(f"""() => {{
+                    var selects = document.querySelectorAll('select');
+                    for (var sel of selects) {{
+                        var opts = Array.from(sel.options).map(o => o.text.trim());
+                        if (opts.includes('1 player') || opts.includes('2 players')) {{
+                            for (var opt of sel.options) {{
+                                if (opt.text.trim() === '{NUM_PLAYERS} players' || opt.text.trim() === '{NUM_PLAYERS}') {{
+                                    sel.value = opt.value;
+                                    sel.dispatchEvent(new Event('change', {{bubbles: true}}));
+                                    try {{ angular.element(sel).triggerHandler('change'); }} catch(e) {{}}
+                                    return;
+                                }}
+                            }}
+                        }}
+                    }}
+                }}""")
+                await asyncio.sleep(0.5)
+
+                # Click Continue again
+                log.info("Clicking Continue again...")
+                await js("""() => {
+                    var buttons = document.querySelectorAll('button, a, input[type="submit"]');
+                    for (var btn of buttons) {
+                        if (btn.textContent.trim() === 'Continue' && btn.offsetParent !== null) {
+                            btn.click();
+                            return;
+                        }
+                    }
+                }""")
+                await wait_for_page_change("Verify Details", timeout=10)
+
+                # Re-check page state
+                page_state = await js("""() => {
+                    var body = document.body.innerText.substring(0, 2000);
+                    if (body.includes('Verify Details')) return 'verify_details';
+                    if (body.includes('Finish') && body.includes('Reservation')) return 'finish';
+                    return 'still_stuck: ' + body.substring(0, 200);
+                }""")
+                log.info(f"Page state after retry: {page_state}")
+
+            elif page_state.startswith('unknown'):
                 # Page might still be loading — wait a bit more
                 log.info("Page still loading, waiting...")
                 await asyncio.sleep(3)
