@@ -1142,20 +1142,36 @@ async def main():
                 return "sniped"
             return False
 
+        async def dismiss_all_modals():
+            """Close ALL open modals/overlays to prevent stacking."""
+            closed = await js("""() => {
+                var count = 0;
+                // Click all visible close buttons in modals
+                var closeBtns = document.querySelectorAll('.modal .close, .modal [data-dismiss="modal"], .modal button.close, .close-reveal-modal');
+                for (var btn of closeBtns) {
+                    if (btn.offsetParent !== null) { btn.click(); count++; }
+                }
+                // Also remove modal-open class from body and hide modal backdrops
+                document.body.classList.remove('modal-open');
+                var backdrops = document.querySelectorAll('.modal-backdrop, .reveal-modal-bg');
+                for (var bd of backdrops) { bd.remove(); count++; }
+                // Hide any remaining visible modals
+                var modals = document.querySelectorAll('.modal.in, .modal.show, .modal[style*="display: block"]');
+                for (var m of modals) { m.style.display = 'none'; m.classList.remove('in', 'show'); count++; }
+                return count;
+            }""")
+            if closed and int(closed) > 0:
+                log.info(f"Dismissed {closed} modal elements")
+                await asyncio.sleep(0.5)
+
         async def ensure_on_search_page():
             """Make sure we're on the tee time search page before retrying."""
+            # Always dismiss modals first — stacked modals show search content underneath
+            await dismiss_all_modals()
             page_text = await js("() => document.body.innerText.substring(0, 1000)")
             if "VIEW" in page_text and "Pricing Options" in page_text:
                 return  # Already on search page
             log.info("Navigating back to search page...")
-            # Close any open modals first
-            await js("""() => {
-                var closeBtns = document.querySelectorAll('.modal .close, .modal [data-dismiss="modal"], .modal button.close');
-                for (var btn of closeBtns) {
-                    if (btn.offsetParent !== null) btn.click();
-                }
-            }""")
-            await asyncio.sleep(0.5)
             # Try clicking Cancel or Previous to go back
             await js("""() => {
                 var links = document.querySelectorAll('a, button');
@@ -1189,12 +1205,17 @@ async def main():
             await ensure_on_search_page()
             return True
 
+        angular_broken_count = 0  # Track consecutive Angular failures for page reload
+
         for attempt in range(MAX_ATTEMPTS):
             log.info("=" * 60)
             log.info(f"BOOKING ATTEMPT {attempt + 1}/{MAX_ATTEMPTS}: {best['time']}")
             log.info("=" * 60)
 
             sniped = False
+
+            # Dismiss any stacked modals from previous attempts
+            await dismiss_all_modals()
 
             # Step 6: Scroll to the target time's VIEW button and click it
             # First, try to scroll the target time into view, then match
@@ -1243,6 +1264,81 @@ async def main():
             log.info(f"VIEW clicked via '{clicked}'")
             await wait_for_page_change("CHOOSE OPTION", timeout=5)
             await screenshot(f"06_attempt{attempt+1}")
+
+            # Check if Angular bindings resolved in the CHOOSE OPTIONS modal
+            # Raw {{...}} templates mean Angular never compiled the modal scope
+            modal_check = await js("""() => {
+                var modal = document.querySelector('.modal.in, .modal.show, .modal[style*="display: block"]');
+                if (!modal) return JSON.stringify({status: 'no_modal'});
+                var text = modal.innerText;
+                var hasRawBindings = text.includes('{{');
+                var hasPricingOptions = text.includes('Member') || text.includes('$');
+                return JSON.stringify({
+                    status: hasRawBindings ? 'broken_angular' : (hasPricingOptions ? 'ok' : 'loading'),
+                    preview: text.substring(0, 200)
+                });
+            }""")
+            mc = json.loads(modal_check) if isinstance(modal_check, str) else modal_check
+
+            if mc.get('status') == 'broken_angular':
+                angular_broken_count += 1
+                log.warning(f"Angular bindings broken in CHOOSE OPTIONS modal (attempt {angular_broken_count})")
+
+                if angular_broken_count <= 2:
+                    # Close the broken modal and do a full page reload to reset Angular
+                    log.info("Closing broken modal and reloading page to reset Angular...")
+                    await dismiss_all_modals()
+                    await asyncio.sleep(0.3)
+                    await js("() => { window.location.hash = '#/search'; }")
+                    await asyncio.sleep(3)
+
+                    # Verify page is usable
+                    page_text = await js("() => document.body.innerText.substring(0, 500)")
+                    if "VIEW" in page_text:
+                        log.info("Page restored after Angular reset — retrying same time")
+                        continue  # Retry the same time slot, don't advance
+                    else:
+                        log.warning("Page not usable after reset, trying full reload...")
+                        await js(f"() => {{ window.location.href = '{BOOKING_URL}'; }}")
+                        await asyncio.sleep(5)
+                        # Re-login if needed
+                        login_check = await js("() => document.body.innerText.includes('My Account') ? 'logged_in' : 'logged_out'")
+                        if login_check != 'logged_in':
+                            log.info("Re-logging in after Angular reset...")
+                            await js("""() => {
+                                var signIn = Array.from(document.querySelectorAll('a, button, span'))
+                                    .find(el => el.textContent.trim() === 'Sign In');
+                                if (signIn) signIn.click();
+                            }""")
+                            await asyncio.sleep(2)
+                            await js(f"""() => {{
+                                var u = document.querySelector("input[name='username'], input[type='email'], input[id*='user'], input[id*='email'], input[name='email'], input[type='text']");
+                                if (u) {{ u.focus(); u.value = '{EZLINKS_USERNAME}'; u.dispatchEvent(new Event('input', {{bubbles: true}})); u.dispatchEvent(new Event('change', {{bubbles: true}})); }}
+                            }}""")
+                            await asyncio.sleep(0.3)
+                            await js(f"""() => {{
+                                var p = document.querySelector("input[type='password']");
+                                if (p) {{ p.focus(); p.value = '{EZLINKS_PASSWORD}'; p.dispatchEvent(new Event('input', {{bubbles: true}})); p.dispatchEvent(new Event('change', {{bubbles: true}})); }}
+                            }}""")
+                            await asyncio.sleep(0.3)
+                            await js("""() => {
+                                var btn = document.querySelector("button[type='submit'], input[type='submit']");
+                                if (!btn) btn = Array.from(document.querySelectorAll('button, a')).find(el => el.textContent.trim().match(/sign in|log in|submit/i));
+                                if (btn) btn.click();
+                            }""")
+                            await asyncio.sleep(3)
+                        continue  # Retry after full reload
+                else:
+                    log.error("Angular bindings broken 3 times in a row — skipping to next time")
+                    angular_broken_count = 0
+                    if not await pick_next_best():
+                        break
+                    continue
+            else:
+                angular_broken_count = 0  # Reset on success
+                if mc.get('status') == 'loading':
+                    log.info("Modal still loading, waiting 2s...")
+                    await asyncio.sleep(2)
 
             # Check for snipe after VIEW
             dialog_result = await dismiss_dialogs()
