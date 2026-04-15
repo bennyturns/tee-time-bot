@@ -1268,6 +1268,8 @@ async def main():
                 continue
 
             log.info(f"VIEW clicked via '{clicked}'")
+            log.info("Waiting 15s for Angular to fully render modal...")
+            await asyncio.sleep(15)
             await wait_for_page_change("CHOOSE OPTION", timeout=5)
             await screenshot(f"06_attempt{attempt+1}")
 
