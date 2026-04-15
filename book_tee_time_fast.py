@@ -764,7 +764,7 @@ async def main():
                 }""")
                 await asyncio.sleep(2)
 
-                # Check page state
+                # Check page state — log date and count for diagnostics
                 try:
                     result = await js("""() => {
                         var body = document.body.innerText;
@@ -774,14 +774,20 @@ async def main():
                             .filter(function(el) {
                                 return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2;
                             }).length;
+                        var inputDate = '';
+                        var input = document.querySelector('input#pickerDate, input[datepicker]');
+                        if (input) inputDate = input.value;
                         return JSON.stringify({
                             pageDate: dateMatch ? dateMatch[1] : '?',
+                            inputDate: inputDate,
                             teeTimeCount: countMatch ? countMatch[1] : '0',
                             viewButtons: viewBtns
                         });
                     }""")
                     ps = json.loads(result) if isinstance(result, str) else result
-                    return int(ps.get('viewButtons', 0))
+                    view_count = int(ps.get('viewButtons', 0))
+                    log.info(f"    Reload state: date={ps.get('pageDate')} input={ps.get('inputDate')} times={ps.get('teeTimeCount')} views={view_count}")
+                    return view_count
                 except Exception as e:
                     log.warning(f"  Page state check failed: {e}")
                     return 0
