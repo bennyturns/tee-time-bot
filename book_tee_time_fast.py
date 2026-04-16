@@ -1149,21 +1149,26 @@ async def main():
             return False
 
         async def dismiss_all_modals():
-            """Close ALL open modals/overlays to prevent stacking."""
+            """Close ALL open modals/overlays to prevent stacking.
+            Handles both Bootstrap and Foundation Reveal modals."""
             closed = await js("""() => {
                 var count = 0;
-                // Click all visible close buttons in modals
-                var closeBtns = document.querySelectorAll('.modal .close, .modal [data-dismiss="modal"], .modal button.close, .close-reveal-modal');
+                // Click all visible close buttons (Bootstrap + Foundation Reveal)
+                var closeBtns = document.querySelectorAll('.modal .close, .modal [data-dismiss="modal"], .modal button.close, .close-reveal-modal, a.close-reveal-modal');
                 for (var btn of closeBtns) {
                     if (btn.offsetParent !== null) { btn.click(); count++; }
                 }
-                // Also remove modal-open class from body and hide modal backdrops
+                // Remove modal-open class from body
                 document.body.classList.remove('modal-open');
+                // Remove backdrops (Bootstrap + Foundation)
                 var backdrops = document.querySelectorAll('.modal-backdrop, .reveal-modal-bg');
                 for (var bd of backdrops) { bd.remove(); count++; }
-                // Hide any remaining visible modals
+                // Hide any remaining visible modals (Bootstrap)
                 var modals = document.querySelectorAll('.modal.in, .modal.show, .modal[style*="display: block"]');
                 for (var m of modals) { m.style.display = 'none'; m.classList.remove('in', 'show'); count++; }
+                // Hide any remaining Foundation Reveal modals
+                var reveals = document.querySelectorAll('.reveal-modal[style*="display: block"], .reveal-modal.open, .reveal-modal[style*="visibility: visible"]');
+                for (var r of reveals) { r.style.display = 'none'; r.classList.remove('open'); count++; }
                 return count;
             }""")
             if closed and int(closed) > 0:
@@ -1275,18 +1280,29 @@ async def main():
 
             # Check if Angular bindings resolved in the CHOOSE OPTIONS modal
             # Raw {{...}} templates mean Angular never compiled the modal scope
+            # Site uses Foundation Reveal modals, not Bootstrap
             modal_check = await js("""() => {
-                var modal = document.querySelector('.modal.in, .modal.show, .modal[style*="display: block"]');
-                if (!modal) return JSON.stringify({status: 'no_modal'});
+                var modal = document.querySelector('.reveal-modal[style*="display: block"], .reveal-modal.open, .reveal-modal[style*="visibility: visible"], .modal.in, .modal.show, .modal[style*="display: block"]');
+                if (!modal) {
+                    // Fallback: check if body text starts with CHOOSE OPTION
+                    var body = document.body.innerText.substring(0, 200);
+                    if (body.includes('CHOOSE OPTION')) {
+                        var hasRaw = body.includes('{{');
+                        return JSON.stringify({status: hasRaw ? 'broken_angular' : 'ok', preview: body, foundVia: 'body_text'});
+                    }
+                    return JSON.stringify({status: 'no_modal'});
+                }
                 var text = modal.innerText;
                 var hasRawBindings = text.includes('{{');
                 var hasPricingOptions = text.includes('Member') || text.includes('$');
                 return JSON.stringify({
                     status: hasRawBindings ? 'broken_angular' : (hasPricingOptions ? 'ok' : 'loading'),
-                    preview: text.substring(0, 200)
+                    preview: text.substring(0, 200),
+                    foundVia: 'modal_selector'
                 });
             }""")
             mc = json.loads(modal_check) if isinstance(modal_check, str) else modal_check
+            log.info(f"Modal check: status={mc.get('status')} via={mc.get('foundVia', '?')}")
 
             if mc.get('status') == 'broken_angular':
                 angular_broken_count += 1
