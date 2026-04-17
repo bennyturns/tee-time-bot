@@ -1308,52 +1308,23 @@ async def main():
                 angular_broken_count += 1
                 log.warning(f"Angular bindings broken in CHOOSE OPTIONS modal (attempt {angular_broken_count})")
 
-                if angular_broken_count <= 2:
-                    # Close the broken modal and do a full page reload to reset Angular
-                    log.info("Closing broken modal and reloading page to reset Angular...")
+                if angular_broken_count <= 3:
+                    # Full page reload + reconfigure (login, date, players, pricing)
+                    log.info("Closing broken modal and doing full reload_and_configure...")
                     await dismiss_all_modals()
                     await asyncio.sleep(0.3)
-                    await js("() => { window.location.hash = '#/search'; }")
-                    await asyncio.sleep(3)
-
-                    # Verify page is usable
-                    page_text = await js("() => document.body.innerText.substring(0, 500)")
-                    if "VIEW" in page_text:
-                        log.info("Page restored after Angular reset — retrying same time")
-                        continue  # Retry the same time slot, don't advance
+                    view_count = await reload_and_configure()
+                    if view_count > 0:
+                        log.info(f"Page restored with {view_count} VIEW buttons — retrying same time")
+                        continue  # Retry the same time slot
+                    elif view_count == -1:
+                        log.error("Cloudflare blocked during Angular recovery — cannot continue")
+                        break
                     else:
-                        log.warning("Page not usable after reset, trying full reload...")
-                        await js(f"() => {{ window.location.href = '{BOOKING_URL}'; }}")
-                        await asyncio.sleep(5)
-                        # Re-login if needed
-                        login_check = await js("() => document.body.innerText.includes('My Account') ? 'logged_in' : 'logged_out'")
-                        if login_check != 'logged_in':
-                            log.info("Re-logging in after Angular reset...")
-                            await js("""() => {
-                                var signIn = Array.from(document.querySelectorAll('a, button, span'))
-                                    .find(el => el.textContent.trim() === 'Sign In');
-                                if (signIn) signIn.click();
-                            }""")
-                            await asyncio.sleep(2)
-                            await js(f"""() => {{
-                                var u = document.querySelector("input[name='username'], input[type='email'], input[id*='user'], input[id*='email'], input[name='email'], input[type='text']");
-                                if (u) {{ u.focus(); u.value = '{EZLINKS_USERNAME}'; u.dispatchEvent(new Event('input', {{bubbles: true}})); u.dispatchEvent(new Event('change', {{bubbles: true}})); }}
-                            }}""")
-                            await asyncio.sleep(0.3)
-                            await js(f"""() => {{
-                                var p = document.querySelector("input[type='password']");
-                                if (p) {{ p.focus(); p.value = '{EZLINKS_PASSWORD}'; p.dispatchEvent(new Event('input', {{bubbles: true}})); p.dispatchEvent(new Event('change', {{bubbles: true}})); }}
-                            }}""")
-                            await asyncio.sleep(0.3)
-                            await js("""() => {
-                                var btn = document.querySelector("button[type='submit'], input[type='submit']");
-                                if (!btn) btn = Array.from(document.querySelectorAll('button, a')).find(el => el.textContent.trim().match(/sign in|log in|submit/i));
-                                if (btn) btn.click();
-                            }""")
-                            await asyncio.sleep(3)
-                        continue  # Retry after full reload
+                        log.warning("No VIEW buttons after reload — retrying reload...")
+                        continue
                 else:
-                    log.error("Angular bindings broken 3 times in a row — skipping to next time")
+                    log.error("Angular bindings broken 4 times in a row — skipping to next time")
                     angular_broken_count = 0
                     if not await pick_next_best():
                         break
