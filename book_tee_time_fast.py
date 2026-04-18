@@ -44,17 +44,27 @@ BOOKING_MINUTE = int(os.getenv("BOOKING_MINUTE", "30"))  # Minute when new times
 POLL_LEAD_SECS = int(os.getenv("POLL_LEAD_SECS", "15"))  # Start polling this many seconds before drop
 
 DRY_RUN = "--dry-run" in sys.argv
+DEBUG = "--debug" in sys.argv
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(Path(__file__).parent / "booking.log"),
-    ],
+# Set up logging — logs/ directory with daily rotation
+_log_dir = Path(__file__).parent / "logs"
+_log_dir.mkdir(exist_ok=True)
+_log_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+_log_stdout = logging.StreamHandler(sys.stdout)
+_log_stdout.setFormatter(_log_fmt)
+from logging.handlers import TimedRotatingFileHandler
+_log_file = TimedRotatingFileHandler(
+    _log_dir / "booking.log",
+    when="midnight",
+    backupCount=30,
 )
+_log_file.suffix = "%Y-%m-%d.log"
+_log_file.setFormatter(_log_fmt)
 log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+log.addHandler(_log_stdout)
+log.addHandler(_log_file)
+log.propagate = False  # Don't let root logger re-format our messages
 
 
 def time_to_minutes(time_str: str) -> int:
@@ -87,6 +97,19 @@ def minutes_to_time(mins: int) -> str:
         h -= 12
     return f"{h}:{m:02d} {period}"
 
+
+
+async def wait_for(page, condition_js, timeout=5.0, interval=0.25, desc="condition"):
+    """Poll a JS condition until it returns truthy, or timeout."""
+    elapsed = 0.0
+    while elapsed < timeout:
+        result = await page.evaluate(condition_js)
+        if result:
+            return result
+        await asyncio.sleep(interval)
+        elapsed += interval
+    log.warning(f"wait_for timed out after {timeout}s waiting for: {desc}")
+    return None
 
 
 async def find_best_tee_time(tee_times, target_time, num_players):
@@ -126,12 +149,16 @@ async def main():
     log.info(f"Players:        {NUM_PLAYERS}")
     log.info(f"Booking URL:    {BOOKING_URL}")
     log.info(f"Dry run:        {DRY_RUN}")
+    log.info(f"Debug:          {DEBUG}")
     log.info("=" * 60)
 
     start_time = asyncio.get_event_loop().time()
 
     # ---------------------------------------------------------------
-    # Phase 1: Use browser-use AI ONLY to pass Cloudflare
+    # Phase 1: Pass Cloudflare challenge
+    #   - Pre-navigate and wait so the checkbox shadow DOM renders
+    #   - Hand the agent a page that's ready to click (1-2 LLM steps)
+    #   - Verify with polling before entering Phase 2
     # ---------------------------------------------------------------
     log.info("Phase 1: Passing Cloudflare with AI agent...")
 
@@ -143,6 +170,7 @@ async def main():
     browser_profile = BrowserProfile(
         headless=False,
         disable_security=False,
+        window_size={"width": 1024, "height": 768},
         allowed_domains=[
             "lochmeregm.ezlinksgolf.com",
             "ezlinksgolf.com",
@@ -151,28 +179,109 @@ async def main():
     )
     browser_session = BrowserSession(browser_profile=browser_profile, keep_alive=True)
 
-    cloudflare_task = f"""
-    Go to {BOOKING_URL}
+    # Pre-navigate and wait so the agent doesn't waste steps on navigation
+    log.info("Pre-navigating and waiting for Cloudflare checkbox to render...")
+    await browser_session.start()
+    pre_page = await browser_session.get_current_page()
+    await pre_page.goto(BOOKING_URL)
+    await asyncio.sleep(10)  # Let shadow DOM expose the label element
+    log.info("Pre-navigation complete, handing off to AI agent...")
 
-    If you see a Cloudflare "Verify you are human" checkbox, click it and wait
-    for the page to load.
+    # Targeted prompt: click the LABEL, not the div[role=alert], then done immediately
+    cloudflare_task = """
+    You are on a page with a Cloudflare "Verify you are human" checkbox.
 
-    Once the tee time booking page loads (you see tee times, a date picker,
-    and player selection), your job is DONE. Report "CLOUDFLARE_PASSED" and stop.
+    On your VERY FIRST action, do BOTH of these together:
+      1. Click the LABEL element (checkbox-state attribute, text "Verify you are human").
+         Do NOT click the div with role=alert — only the label works.
+      2. Call done("CLOUDFLARE_PASSED").
 
-    Do NOT interact with any booking elements. Just pass Cloudflare and stop.
+    If the booking page is already loaded (date picker, tee times), call done immediately.
+
+    Do NOT wait. Do NOT use JavaScript. Do NOT take extra steps.
     """
 
-    agent = Agent(
-        task=cloudflare_task,
-        llm=llm,
-        use_vision=True,
-        browser_session=browser_session,
-        max_failures=3,
-        max_actions_per_step=2,
-    )
+    MAX_CF_RETRIES = 3
+    CF_POLL_TIMEOUT = 20  # seconds to wait for page transition after agent
+    CF_POLL_INTERVAL = 2
+    cf_passed = False
 
-    result = await agent.run()
+    for cf_attempt in range(1, MAX_CF_RETRIES + 1):
+        log.info(f"Cloudflare agent attempt {cf_attempt}/{MAX_CF_RETRIES}...")
+
+        agent = Agent(
+            task=cloudflare_task,
+            llm=llm,
+            use_vision=True,
+            browser_session=browser_session,
+            max_failures=2,
+            max_actions_per_step=2,
+            flash_mode=True,
+            use_judge=False,
+        )
+        result = await agent.run()
+
+        elapsed = asyncio.get_event_loop().time() - start_time
+        log.info(f"[{elapsed:.1f}s] Agent attempt {cf_attempt} finished")
+
+        # --- Verify: poll the page to confirm Cloudflare is gone ---
+        page_check = await browser_session.get_current_page()
+        if not page_check:
+            log.error("Could not get page for Cloudflare verification")
+            sys.exit(1)
+
+        poll_elapsed = 0.0
+        while poll_elapsed < CF_POLL_TIMEOUT:
+            cf_check = await page_check.evaluate("""() => {
+                var body = document.body ? document.body.innerText : '';
+                var url = window.location.href;
+                var hasChallenge = body.includes('Verify you are human') ||
+                                  body.includes('Just a moment') ||
+                                  body.includes('security verification') ||
+                                  body.includes('security service') ||
+                                  body.includes('malicious bots') ||
+                                  body.includes('not a bot') ||
+                                  url.includes('challenges.cloudflare.com') ||
+                                  !!document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                var isTransitioning = (body.includes('Verifying') && !body.includes('security verification')) ||
+                                     body.trim().length < 50;
+                var hasBookingContent = body.includes('Sign In') ||
+                                       body.includes('Tee Times') ||
+                                       body.includes('Book') ||
+                                       body.includes('Player');
+                return JSON.stringify({
+                    hasChallenge: hasChallenge,
+                    isTransitioning: isTransitioning,
+                    hasBookingContent: hasBookingContent,
+                    url: url,
+                    bodyPreview: body.substring(0, 300)
+                });
+            }""")
+            log.info(f"  Verify poll +{poll_elapsed:.0f}s: {cf_check}")
+
+            cf_status = json.loads(cf_check) if isinstance(cf_check, str) else cf_check
+
+            if not cf_status.get("hasChallenge") and cf_status.get("hasBookingContent"):
+                log.info("Cloudflare passed — booking page confirmed.")
+                cf_passed = True
+                break
+
+            # Active challenge, not transitioning — stop polling, retry agent
+            if cf_status.get("hasChallenge") and not cf_status.get("isTransitioning"):
+                log.info("Challenge still active — will retry agent.")
+                break
+
+            # Transitional state — keep waiting
+            log.info("  Page transitioning...")
+            await asyncio.sleep(CF_POLL_INTERVAL)
+            poll_elapsed += CF_POLL_INTERVAL
+
+        if cf_passed:
+            break
+
+        if cf_attempt >= MAX_CF_RETRIES:
+            log.error(f"Cloudflare not passed after {MAX_CF_RETRIES} attempts. Aborting.")
+            sys.exit(1)
 
     elapsed = asyncio.get_event_loop().time() - start_time
     log.info(f"[{elapsed:.1f}s] Cloudflare phase complete")
@@ -187,10 +296,87 @@ async def main():
         log.error("Could not get page from browser session")
         sys.exit(1)
 
-    js = page.evaluate  # shorthand
+    # Disable auto-attach — browser-use enables this at startup which causes Chrome to
+    # create CDP sessions for every iframe/worker/popup. The EZLinks site detects these
+    # extra sessions as "multiple tabs" and shows a logout warning.
+    try:
+        await browser_session._cdp_client_root.send.Target.setAutoAttach(
+            params={'autoAttach': False, 'waitForDebuggerOnStart': False, 'flatten': True}
+        )
+        log.info("Disabled CDP auto-attach to prevent multi-tab detection")
+    except Exception as e:
+        log.warning(f"Could not disable auto-attach: {e}")
+
+    # Use browser-use's existing page.evaluate — do NOT create additional CDP sessions
+    js = page.evaluate
+
+    # --- Diagnostic helpers (--debug mode) ---
+    cdp_root = browser_session._cdp_client_root
+
+    async def dump_targets(label):
+        """Log all Chrome targets — shows exactly what Chrome thinks is open."""
+        if not DEBUG:
+            return
+        try:
+            result = await cdp_root.send.Target.getTargets(params={})
+            targets = result.get('targetInfos', [])
+            log.info(f"=== CDP TARGETS [{label}] === ({len(targets)} total)")
+            for t in targets:
+                log.info(f"  type={t.get('type', '?'):15s}  attached={str(t.get('attached', '?')):5s}  "
+                         f"url={t.get('url', '?')[:80]}")
+            log.info(f"=== END TARGETS [{label}] ===")
+        except Exception as e:
+            log.warning(f"dump_targets({label}) failed: {e}")
+
+    async def dump_sessions(label):
+        """Log all CDP sessions browser-use is tracking."""
+        if not DEBUG:
+            return
+        try:
+            sm = browser_session._session_manager
+            sessions = getattr(sm, '_sessions', {})
+            targets = getattr(sm, '_targets', {})
+            log.info(f"=== CDP SESSIONS [{label}] === ({len(sessions)} sessions, {len(targets)} tracked targets)")
+            for sid, sess in sessions.items():
+                tid = getattr(sm, '_session_to_target', {}).get(sid, '?')
+                tgt = targets.get(tid)
+                tgt_url = getattr(tgt, 'url', '?') if tgt else '?'
+                tgt_type = getattr(tgt, 'type', '?') if tgt else '?'
+                log.info(f"  session={str(sid)[:20]}  target_type={tgt_type}  url={str(tgt_url)[:80]}")
+            log.info(f"=== END SESSIONS [{label}] ===")
+        except Exception as e:
+            log.warning(f"dump_sessions({label}) failed: {e}")
+
+    async def check_popup(label):
+        """Check if the 'multiple tabs' popup is visible right now."""
+        try:
+            popup_text = await js(r"""() => {
+                var body = document.body ? document.body.innerText.substring(0, 3000) : '';
+                var checks = {
+                    hasMultipleTabs: /multiple\s+tab/i.test(body),
+                    hasLoggedOut: /being\s+logged\s+out/i.test(body),
+                    hasSessionExpired: /session.*expir/i.test(body),
+                    hasSignedOut: /signed\s+out/i.test(body),
+                    currentUrl: window.location.href,
+                    modalVisible: !!(document.querySelector('.modal.in, .modal.show, .modal[style*="display: block"]'))
+                };
+                return JSON.stringify(checks);
+            }""")
+            result = json.loads(popup_text) if isinstance(popup_text, str) else popup_text
+            has_issue = result.get('hasMultipleTabs') or result.get('hasLoggedOut') or result.get('hasSessionExpired') or result.get('hasSignedOut')
+            if has_issue:
+                log.warning(f"!!! POPUP DETECTED [{label}] !!! {json.dumps(result, indent=2)}")
+            elif DEBUG:
+                log.info(f"Popup check [{label}]: clean — url={result.get('currentUrl', '?')[:60]} modal={result.get('modalVisible')}")
+            return has_issue
+        except Exception as e:
+            log.warning(f"check_popup({label}) failed: {e}")
+            return False
 
     debug_dir = Path(__file__).parent
     async def screenshot(name):
+        if not DEBUG:
+            return
         try:
             import base64
             b64 = await page.screenshot(format='png')
@@ -200,10 +386,16 @@ async def main():
         except Exception as e:
             log.warning(f"Screenshot failed ({name}): {e}")
 
+    # Diagnostic: dump state right after Cloudflare
+    await dump_targets("after_cloudflare")
+    await dump_sessions("after_cloudflare")
+    await check_popup("after_cloudflare")
+
     try:
         # Step 1: Sign in
         log.info("Signing in...")
         await screenshot("01_before_signin")
+        await check_popup("before_signin_click")
 
         await js("""() => {
             var signIn = Array.from(document.querySelectorAll('a, button, span'))
@@ -212,23 +404,7 @@ async def main():
         }""")
         await asyncio.sleep(2)
         await screenshot("02_signin_clicked")
-
-        # Check what input fields are visible
-        fields_info = await js("""() => {
-            var inputs = document.querySelectorAll('input');
-            var result = [];
-            inputs.forEach(function(inp) {
-                result.push({
-                    type: inp.type,
-                    name: inp.name,
-                    id: inp.id,
-                    placeholder: inp.placeholder,
-                    visible: inp.offsetParent !== null
-                });
-            });
-            return JSON.stringify(result);
-        }""")
-        log.info(f"Available input fields: {fields_info}")
+        await check_popup("after_signin_modal_open")
 
         await js(f"""() => {{
             var userField = document.querySelector("input[name='username'], input[type='email'], input[id*='user'], input[id*='email'], input[name='email'], input[type='text']");
@@ -262,6 +438,15 @@ async def main():
         }""")
         await asyncio.sleep(3)
         await screenshot("03_after_signin")
+        await dump_targets("after_submit_login")
+        await dump_sessions("after_submit_login")
+        await check_popup("after_submit_login")
+
+        if DEBUG:
+            # Check again after a brief wait — popup may appear with a delay
+            await asyncio.sleep(2)
+            await check_popup("after_submit_login_+2s")
+            await screenshot("03b_login_popup_check")
 
         # Verify login succeeded
         login_check = await js("""() => {
@@ -279,7 +464,7 @@ async def main():
         elapsed = asyncio.get_event_loop().time() - start_time
         log.info(f"[{elapsed:.1f}s] Signed in")
 
-        # Step 2: Set date
+        # Step 2: Set date — combine input value + calendar click in one call
         log.info(f"Setting date to {target_date_str}...")
         target_day = int(target_date_str.split("/")[1])
 
@@ -291,10 +476,6 @@ async def main():
                 input.dispatchEvent(new Event('change', {{bubbles: true}}));
                 try {{ angular.element(input).triggerHandler('change'); }} catch(e) {{}}
             }}
-        }}""")
-        await asyncio.sleep(1)
-
-        await js(f"""() => {{
             var cells = document.querySelectorAll('.ui-state-default');
             for (var cell of cells) {{
                 if (cell.textContent.trim() === '{target_day}') {{
@@ -303,26 +484,43 @@ async def main():
                 }}
             }}
         }}""")
-        await asyncio.sleep(2)
+        await wait_for(page, f"""() => {{
+            var body = document.body.innerText;
+            return body.includes('{target_date_str}');
+        }}""", timeout=5, desc="date reflected")
 
+        # Wait for tee times to reload after date change — spinner must clear
+        log.info("Waiting for tee times to load after date change...")
+        await wait_for(page, """() => {
+            // Check page is not in loading state
+            var body = document.body.innerText;
+            var headerMatch = body.match(/(\\d+)\\s+tee time/i);
+            var count = headerMatch ? parseInt(headerMatch[1]) : 0;
+            // Wait until we have a reasonable number of times and VIEW buttons are visible
+            var viewBtns = Array.from(document.querySelectorAll('a, button, span, div, label'))
+                .filter(function(el) {
+                    return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2 && el.offsetParent !== null;
+                });
+            return count >= 10 && viewBtns.length >= 3 ? count : null;
+        }""", timeout=15, desc="tee times loaded after date change")
         await screenshot("03b_after_date")
         elapsed = asyncio.get_event_loop().time() - start_time
-        log.info(f"[{elapsed:.1f}s] Date set")
+        log.info(f"[{elapsed:.1f}s] Date set and tee times loaded")
 
         # Step 3: Set players
         log.info(f"Setting players to {NUM_PLAYERS}...")
-        # Wait for page to stabilize after date change
-        await asyncio.sleep(2)
         await js(f"""() => {{
             var btn = document.querySelector('button#players-button');
             if (!btn) {{
-                // Try finding by text content
                 btn = Array.from(document.querySelectorAll('button'))
-                    .find(b => b.id && b.id.includes('player'));
+                    .find(function(b) {{ return b.id && b.id.includes('player'); }});
             }}
             if (btn) btn.click();
         }}""")
-        await asyncio.sleep(1)
+        await wait_for(page, """() => {
+            var menu = document.querySelector('ul.dropdown-menu');
+            return menu && menu.offsetParent !== null;
+        }""", timeout=3, desc="player dropdown")
         await js(f"""() => {{
             var links = document.querySelectorAll('ul.dropdown-menu a, li a');
             for (var link of links) {{
@@ -333,8 +531,20 @@ async def main():
             }}
             return false;
         }}""")
-        await asyncio.sleep(3)
+        await wait_for(page, f"""() => {{
+            var body = document.body.innerText;
+            return body.includes('{NUM_PLAYERS} players') || body.includes('{NUM_PLAYERS} player');
+        }}""", timeout=5, desc="player count reflected")
 
+        # Wait for tee times to reload after player change
+        log.info("Waiting for tee times to reload after player change...")
+        await wait_for(page, """() => {
+            var viewBtns = Array.from(document.querySelectorAll('a, button, span, div, label'))
+                .filter(function(el) {
+                    return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2 && el.offsetParent !== null;
+                });
+            return viewBtns.length >= 3 ? viewBtns.length : null;
+        }""", timeout=10, desc="tee times reloaded after players")
         await screenshot("03c_after_players")
         elapsed = asyncio.get_event_loop().time() - start_time
         log.info(f"[{elapsed:.1f}s] Players set")
@@ -350,7 +560,6 @@ async def main():
                     return true;
                 }
             }
-            // Try checkboxes/radio buttons near the text
             var inputs = document.querySelectorAll('input[type="checkbox"], input[type="radio"]');
             for (var inp of inputs) {
                 var parent = inp.parentElement;
@@ -361,24 +570,45 @@ async def main():
             }
             return false;
         }""")
-        await asyncio.sleep(3)
+        # Wait for tee times to fully load:
+        # 1. Wait for loading spinner/overlay to disappear
+        # 2. Wait for multiple VIEW buttons to render (not just 1)
+        log.info("Waiting for tee times to finish loading...")
+        await wait_for(page, r"""() => {
+            // Check that the tee time count header has settled (not "0 tee times")
+            var headerText = document.body.innerText.match(/(\d+)\s+tee time/i);
+            var count = headerText ? parseInt(headerText[1]) : 0;
+            if (count < 3) return null;  // still loading
+
+            // Check that VIEW buttons have actually rendered
+            var viewBtns = Array.from(document.querySelectorAll('a, button, span, div, label'))
+                .filter(function(el) {
+                    return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2 && el.offsetParent !== null;
+                });
+            return viewBtns.length >= 3 ? viewBtns.length : null;
+        }""", timeout=20, desc="tee times fully loaded")
+
+        # Final check — how many VIEW buttons do we have?
+        view_count = await js("""() => {
+            var viewBtns = Array.from(document.querySelectorAll('a, button, span, div, label'))
+                .filter(function(el) {
+                    return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2 && el.offsetParent !== null;
+                });
+            var headerText = document.body.innerText.match(/(\\d+)\\s+tee time/i);
+            return JSON.stringify({viewButtons: viewBtns.length, headerCount: headerText ? headerText[1] : '?'});
+        }""")
+        log.info(f"Page load check: {view_count}")
+
         await screenshot("03d_after_pricing")
         elapsed = asyncio.get_event_loop().time() - start_time
-        log.info(f"[{elapsed:.1f}s] Pricing option set")
+        log.info(f"[{elapsed:.1f}s] Pricing option set, tee times loaded")
 
-        # Wait for tee times to reload after player change
-        log.info("Waiting for tee times to load...")
-        await asyncio.sleep(3)
-
-        # Scroll to top of tee times list first
-        await js("""() => {
-            window.scrollTo(0, 0);
-        }""")
-        await asyncio.sleep(1)
+        await js("() => { window.scrollTo(0, 0); }")
 
         # ---------------------------------------------------------------
         # WAIT FOR BOOKING WINDOW: Sit on page, then poll for new times
         # ---------------------------------------------------------------
+        POLL_TIMEOUT_SECONDS = 3600  # 60 minutes max polling
         now = datetime.now()
         drop_time = now.replace(hour=BOOKING_HOUR, minute=BOOKING_MINUTE, second=0, microsecond=0)
         poll_start = drop_time - timedelta(seconds=POLL_LEAD_SECS)
@@ -405,22 +635,33 @@ async def main():
             log.info("Starting rapid refresh polling for new tee times!")
 
         if now < drop_time:
-            # Poll by refreshing the page rapidly until morning times appear
+            # Poll by re-triggering the date (Angular refresh) until VIEW buttons appear
+            # VIEW buttons = actual bookable tee time slots (avoids false positives from page chrome)
+            # No full page reload — just nudge the date back and forth to refresh tee times
             target_minutes = time_to_minutes(TARGET_TIME)
             poll_attempt = 0
-            MAX_POLL_ATTEMPTS = 60  # ~60 seconds of polling at 1s intervals
-            tee_times = None
+            poll_start = asyncio.get_event_loop().time()
+            view_count = 0
 
-            while poll_attempt < MAX_POLL_ATTEMPTS:
+            while (asyncio.get_event_loop().time() - poll_start) < POLL_TIMEOUT_SECONDS:
                 poll_attempt += 1
                 now = datetime.now()
-                log.info(f"Poll attempt {poll_attempt} at {now.strftime('%H:%M:%S.%f')[:-3]}...")
+                if poll_attempt <= 5 or poll_attempt % 30 == 0:
+                    elapsed_poll = asyncio.get_event_loop().time() - poll_start
+                    log.info(f"Poll attempt {poll_attempt} at {now.strftime('%H:%M:%S.%f')[:-3]} ({elapsed_poll:.0f}s elapsed)...")
 
-                # Refresh and re-apply filters
-                await js("() => { location.reload(); }")
-                await asyncio.sleep(3)
-
-                # Re-set date
+                # Re-trigger date to refresh tee times without full reload
+                await js(f"""() => {{
+                    var input = document.querySelector('input#pickerDate, input[datepicker]');
+                    if (input) {{
+                        // Nudge to different date then back to force Angular refresh
+                        input.value = '';
+                        input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        try {{ angular.element(input).triggerHandler('change'); }} catch(e) {{}}
+                    }}
+                }}""")
+                await asyncio.sleep(0.3)
                 await js(f"""() => {{
                     var input = document.querySelector('input#pickerDate, input[datepicker]');
                     if (input) {{
@@ -429,9 +670,6 @@ async def main():
                         input.dispatchEvent(new Event('change', {{bubbles: true}}));
                         try {{ angular.element(input).triggerHandler('change'); }} catch(e) {{}}
                     }}
-                }}""")
-                await asyncio.sleep(1)
-                await js(f"""() => {{
                     var cells = document.querySelectorAll('.ui-state-default');
                     for (var cell of cells) {{
                         if (cell.textContent.trim() === '{target_day}') {{
@@ -442,64 +680,27 @@ async def main():
                 }}""")
                 await asyncio.sleep(1)
 
-                # Re-set players
-                await js(f"""() => {{
-                    var btn = document.querySelector('button#players-button');
-                    if (!btn) {{
-                        btn = Array.from(document.querySelectorAll('button'))
-                            .find(b => b.id && b.id.includes('player'));
-                    }}
-                    if (btn) btn.click();
-                }}""")
-                await asyncio.sleep(0.5)
-                await js(f"""() => {{
-                    var links = document.querySelectorAll('ul.dropdown-menu a, li a');
-                    for (var link of links) {{
-                        if (link.textContent.trim() === '{NUM_PLAYERS}') {{
-                            link.click();
-                            return true;
-                        }}
-                    }}
-                    return false;
-                }}""")
-                await asyncio.sleep(1)
-
-                # Re-select pricing
-                await js("""() => {
-                    var labels = document.querySelectorAll('label, span, a, div, button');
-                    for (var el of labels) {
-                        var text = el.textContent.trim();
-                        if (text === 'Member Walk 18H') {
-                            el.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                }""")
-                await asyncio.sleep(1)
-
-                # Quick scrape — check if morning times exist
-                quick_check = await js("""() => {
-                    var body = document.body.innerText;
-                    // Look for morning times (before noon)
-                    var morningTimes = body.match(/\\b[5-9]:\\d{2}\\s*AM|\\b1[0-1]:\\d{2}\\s*AM/gi);
-                    return morningTimes ? morningTimes.join(',') : '';
+                # Check for actual bookable slots by counting VIEW buttons
+                view_count = await js("""() => {
+                    return Array.from(document.querySelectorAll('a, button, span, div, label'))
+                        .filter(function(el) {
+                            return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2;
+                        }).length;
                 }""")
 
-                if quick_check:
-                    log.info(f"Morning times detected: {quick_check}")
+                if view_count and view_count > 0:
+                    log.info(f"Found {view_count} VIEW buttons — tee times are live!")
                     await js("() => { window.scrollTo(0, 0); }")
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)
                     break
-                else:
-                    log.info("  No morning times yet...")
 
-            if not quick_check:
-                log.error(f"No morning times appeared after {MAX_POLL_ATTEMPTS} poll attempts")
-                await screenshot("04_poll_exhausted")
-                sys.exit(1)
-
-            log.info("Morning times are live! Proceeding to scrape and book...")
+            elapsed_poll = asyncio.get_event_loop().time() - poll_start
+            if not view_count or view_count == 0:
+                log.warning(f"No tee times appeared after {poll_attempt} poll attempts ({elapsed_poll:.0f}s) — falling back to best available time")
+                await screenshot("04_poll_exhausted_fallback")
+                log.info("Proceeding with best available time (fallback)...")
+            else:
+                log.info(f"Tee times detected after {poll_attempt} polls ({elapsed_poll:.0f}s). Proceeding to scrape and book...")
         else:
             log.info("Booking window already open, proceeding immediately")
 
@@ -531,50 +732,56 @@ async def main():
 
         SCRAPE_JS = """() => {
             var results = [];
+            var seen = {};
 
-            // Strategy 0: Try to get data directly from Angular scope (fastest, gets ALL times)
+            function addTime(time, maxP, minP, price) {
+                if (seen[time]) return;
+                var parts = time.match(/(\\d+):(\\d+)/);
+                if (!parts) return;
+                var h = parseInt(parts[1]), m = parseInt(parts[2]);
+                if (h < 1 || h > 12 || m < 0 || m > 59) return;
+                seen[time] = true;
+                results.push({ time: time, maxPlayers: maxP, minPlayers: minP, price: price });
+            }
+
+            // Strategy 0: Angular scope — may return paginated subset
             try {
-                var scope = angular.element(document.querySelector('[ng-repeat]')).scope();
-                if (scope && scope.$parent) {
-                    var parentScope = scope.$parent;
-                    // Look for tee time array in scope
-                    var keys = Object.keys(parentScope);
-                    for (var k = 0; k < keys.length; k++) {
-                        var val = parentScope[keys[k]];
-                        if (Array.isArray(val) && val.length > 0 && val[0] && (val[0].time || val[0].teeTime || val[0].startTime)) {
-                            val.forEach(function(tt) {
-                                var timeStr = tt.time || tt.teeTime || tt.startTime || '';
-                                if (timeStr) {
-                                    results.push({
-                                        time: timeStr,
-                                        maxPlayers: tt.maxPlayers || tt.max_players || 4,
-                                        minPlayers: tt.minPlayers || tt.min_players || 1,
-                                        price: tt.price || tt.greenFee || 'N/A',
-                                    });
-                                }
-                            });
-                            if (results.length > 0) {
-                                var seen = {};
-                                return JSON.stringify(results.filter(function(r) {
-                                    if (seen[r.time]) return false;
-                                    seen[r.time] = true;
-                                    return true;
-                                }));
+                var ngEls = document.querySelectorAll('[ng-repeat], [data-ng-repeat]');
+                for (var ngIdx = 0; ngIdx < ngEls.length; ngIdx++) {
+                    var scope = angular.element(ngEls[ngIdx]).scope();
+                    if (!scope) continue;
+                    // Walk up scope chain looking for tee time arrays
+                    var s = scope;
+                    for (var depth = 0; depth < 5 && s; depth++) {
+                        var keys = Object.keys(s);
+                        for (var k = 0; k < keys.length; k++) {
+                            var val = s[keys[k]];
+                            if (Array.isArray(val) && val.length > 0 && val[0] && (val[0].time || val[0].teeTime || val[0].startTime)) {
+                                val.forEach(function(tt) {
+                                    var timeStr = tt.time || tt.teeTime || tt.startTime || '';
+                                    if (timeStr) {
+                                        addTime(timeStr, tt.maxPlayers || tt.max_players || 4, tt.minPlayers || tt.min_players || 1, tt.price || tt.greenFee || 'N/A');
+                                    }
+                                });
                             }
                         }
+                        s = s.$parent;
                     }
+                    if (results.length > 0) break;
                 }
             } catch(e) {}
 
-            // Strategy 1: Find VIEW buttons and walk up to their tee time cards
-            var viewBtns = Array.from(document.querySelectorAll('a, button'))
-                .filter(function(el) { return el.textContent.trim() === 'VIEW'; });
+            // Strategy 1: Find VIEW buttons (any element type) and walk up to tee time cards
+            var viewBtns = Array.from(document.querySelectorAll('a, button, span, div, label'))
+                .filter(function(el) {
+                    return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2;
+                });
 
             viewBtns.forEach(function(btn) {
                 var container = btn.closest('.panel, .card, .col-md-4, .col-sm-4, .col-lg-4, [ng-repeat], [data-ng-repeat]');
                 if (!container) {
                     container = btn.parentElement;
-                    for (var i = 0; i < 5 && container; i++) {
+                    for (var i = 0; i < 6 && container; i++) {
                         if (container.innerText && container.innerText.match(/\\d{1,2}:\\d{2}\\s*[AP]M/i)) break;
                         container = container.parentElement;
                     }
@@ -587,21 +794,11 @@ async def main():
                 var priceMatch = text.match(/\\$(\\d+\\.\\d+)/);
 
                 if (timeMatch) {
-                    var parts = timeMatch[1].match(/(\\d+):(\\d+)/);
-                    var h = parseInt(parts[1]);
-                    var m = parseInt(parts[2]);
-                    if (h >= 1 && h <= 12 && m >= 0 && m <= 59) {
-                        results.push({
-                            time: timeMatch[1],
-                            maxPlayers: playerMatch ? parseInt(playerMatch[2]) : 4,
-                            minPlayers: playerMatch ? parseInt(playerMatch[1]) : 1,
-                            price: priceMatch ? priceMatch[0] : 'N/A',
-                        });
-                    }
+                    addTime(timeMatch[1], playerMatch ? parseInt(playerMatch[2]) : 4, playerMatch ? parseInt(playerMatch[1]) : 1, priceMatch ? priceMatch[0] : 'N/A');
                 }
             });
 
-            // Strategy 2: ng-repeat elements
+            // Strategy 2: ng-repeat elements (fallback if above found nothing)
             if (results.length === 0) {
                 var ngRepeats = document.querySelectorAll('[ng-repeat], [data-ng-repeat]');
                 ngRepeats.forEach(function(el) {
@@ -610,67 +807,24 @@ async def main():
                     if (timeMatch) {
                         var playerMatch = text.match(/(\\d+)[\\u2013-](\\d+)\\s*Player/i);
                         var priceMatch = text.match(/\\$(\\d+\\.\\d+)/);
-                        var parts = timeMatch[1].match(/(\\d+):(\\d+)/);
-                        var h = parseInt(parts[1]);
-                        var m = parseInt(parts[2]);
-                        if (h >= 1 && h <= 12 && m >= 0 && m <= 59) {
-                            results.push({
-                                time: timeMatch[1],
-                                maxPlayers: playerMatch ? parseInt(playerMatch[2]) : 4,
-                                minPlayers: playerMatch ? parseInt(playerMatch[1]) : 1,
-                                price: priceMatch ? priceMatch[0] : 'N/A',
-                            });
-                        }
+                        addTime(timeMatch[1], playerMatch ? parseInt(playerMatch[2]) : 4, playerMatch ? parseInt(playerMatch[1]) : 1, priceMatch ? priceMatch[0] : 'N/A');
                     }
                 });
             }
 
-            // Strategy 3: Parse body text but only lines that look like standalone times
-            if (results.length === 0) {
-                var body = document.body.innerText;
-                var lines = body.split('\\n');
-                for (var i = 0; i < lines.length; i++) {
-                    var line = lines[i].trim();
-                    var timeMatch = line.match(/^(\\d{1,2}:\\d{2}\\s*[AP]M)$/i);
-                    if (timeMatch) {
-                        var nearby = lines.slice(Math.max(0, i-3), Math.min(lines.length, i+5)).join(' ');
-                        if (nearby.includes('VIEW') || nearby.match(/Player/i)) {
-                            var parts = timeMatch[1].match(/(\\d+):(\\d+)/);
-                            var h = parseInt(parts[1]);
-                            var m = parseInt(parts[2]);
-                            if (h >= 1 && h <= 12 && m >= 0 && m <= 59) {
-                                var playerMatch = nearby.match(/(\\d+)[\\u2013-](\\d+)\\s*Player/i);
-                                var priceMatch = nearby.match(/\\$(\\d+\\.\\d+)/);
-                                results.push({
-                                    time: timeMatch[1],
-                                    maxPlayers: playerMatch ? parseInt(playerMatch[2]) : 4,
-                                    minPlayers: playerMatch ? parseInt(playerMatch[1]) : 1,
-                                    price: priceMatch ? priceMatch[0] : 'N/A',
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-
-            var seen = {};
-            return JSON.stringify(results.filter(function(r) {
-                if (seen[r.time]) return false;
-                seen[r.time] = true;
-                return true;
-            }));
+            return JSON.stringify(results);
         }"""
 
         log.info("Scraping tee times (scrolling to collect all)...")
 
-        # Scroll through the page to load all tee times, collecting as we go
+        # Scroll through the page to load all tee times, break early when done
         all_times = set()
         all_results = []
+        no_new_streak = 0
         for scroll_pass in range(10):
             raw = await js(SCRAPE_JS)
             if isinstance(raw, str):
-                import json as _json
-                batch = _json.loads(raw)
+                batch = json.loads(raw)
             elif isinstance(raw, list):
                 batch = raw
             else:
@@ -682,9 +836,15 @@ async def main():
                     all_results.append(tt)
                     new_count += 1
             log.info(f"  Scroll pass {scroll_pass+1}: found {len(batch)} times, {new_count} new (total: {len(all_results)})")
-            if scroll_pass < 9:
-                await js("() => { window.scrollBy(0, 800); }")
-                await asyncio.sleep(0.5)
+            if new_count == 0:
+                no_new_streak += 1
+                if no_new_streak >= 2:
+                    log.info("  No new times for 2 passes, done scraping")
+                    break
+            else:
+                no_new_streak = 0
+            await js("() => { window.scrollBy(0, 800); }")
+            await asyncio.sleep(0.3)
 
         # Use collected results instead of single scrape
         raw_result = json.dumps(all_results)
@@ -693,8 +853,7 @@ async def main():
 
         # CDP evaluate may return the data in different formats
         if isinstance(raw_result, str):
-            import json as _json
-            tee_times = _json.loads(raw_result)
+            tee_times = json.loads(raw_result)
         elif isinstance(raw_result, list):
             tee_times = raw_result
         else:
@@ -705,21 +864,89 @@ async def main():
             await asyncio.sleep(3)
             raw_result = await js(SCRAPE_JS)
             if isinstance(raw_result, str):
-                tee_times = _json.loads(raw_result)
+                tee_times = json.loads(raw_result)
             elif isinstance(raw_result, list):
                 tee_times = raw_result
             else:
                 tee_times = raw_result
 
         if not tee_times:
-            log.error("No tee times found")
-            await page.screenshot(str(Path(__file__).parent / "debug_no_times.png"))
-            sys.exit(1)
+            log.warning("No tee times found after retry — waiting 10s and trying once more...")
+            await asyncio.sleep(10)
+            # Re-trigger date to force refresh
+            await js(f"""() => {{
+                var input = document.querySelector('input#pickerDate, input[datepicker]');
+                if (input) {{
+                    input.value = '{target_date_str}';
+                    input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    try {{ angular.element(input).triggerHandler('change'); }} catch(e) {{}}
+                }}
+            }}""")
+            await asyncio.sleep(5)
+            raw_result = await js(SCRAPE_JS)
+            if isinstance(raw_result, str):
+                tee_times = json.loads(raw_result)
+            elif isinstance(raw_result, list):
+                tee_times = raw_result
+            else:
+                tee_times = raw_result
+
+        if not tee_times:
+            # Check if we still have time to keep trying
+            total_elapsed = asyncio.get_event_loop().time() - start_time
+            if total_elapsed < POLL_TIMEOUT_SECONDS:
+                log.warning(f"No tee times found after scrape retries — re-polling ({total_elapsed:.0f}s elapsed, {POLL_TIMEOUT_SECONDS - total_elapsed:.0f}s remaining)...")
+                await screenshot("debug_no_times_repoll")
+                # Re-enter a mini poll loop for remaining time
+                while (asyncio.get_event_loop().time() - start_time) < POLL_TIMEOUT_SECONDS:
+                    await js(f"""() => {{
+                        var input = document.querySelector('input#pickerDate, input[datepicker]');
+                        if (input) {{
+                            input.value = '';
+                            input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            try {{ angular.element(input).triggerHandler('change'); }} catch(e) {{}}
+                        }}
+                    }}""")
+                    await asyncio.sleep(0.3)
+                    await js(f"""() => {{
+                        var input = document.querySelector('input#pickerDate, input[datepicker]');
+                        if (input) {{
+                            input.value = '{target_date_str}';
+                            input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            try {{ angular.element(input).triggerHandler('change'); }} catch(e) {{}}
+                        }}
+                    }}""")
+                    await asyncio.sleep(2)
+                    vc = await js("""() => {
+                        return Array.from(document.querySelectorAll('a, button, span, div, label'))
+                            .filter(function(el) {
+                                return el.textContent.trim().toUpperCase() === 'VIEW' && el.childNodes.length <= 2;
+                            }).length;
+                    }""")
+                    if vc and vc > 0:
+                        log.info(f"Re-poll found {vc} VIEW buttons! Re-scraping...")
+                        await asyncio.sleep(0.5)
+                        raw_result = await js(SCRAPE_JS)
+                        if isinstance(raw_result, str):
+                            tee_times = json.loads(raw_result)
+                        elif isinstance(raw_result, list):
+                            tee_times = raw_result
+                        if tee_times:
+                            break
+                        log.info("VIEW buttons present but scrape empty, continuing poll...")
+
+            if not tee_times:
+                log.error("No tee times found after all polling and retries")
+                await screenshot("debug_no_times_final")
+                sys.exit(1)
 
         # Ensure tee_times is a list of dicts
         if isinstance(tee_times, list) and tee_times and isinstance(tee_times[0], str):
             log.warning(f"Tee times returned as strings, attempting to parse")
-            tee_times = [_json.loads(t) if isinstance(t, str) else t for t in tee_times]
+            tee_times = [json.loads(t) if isinstance(t, str) else t for t in tee_times]
 
         elapsed = asyncio.get_event_loop().time() - start_time
         log.info(f"[{elapsed:.1f}s] Found {len(tee_times)} tee times")
@@ -734,7 +961,10 @@ async def main():
         best = await find_best_tee_time(tee_times, TARGET_TIME, NUM_PLAYERS)
 
         if not best:
-            log.error(f"No tee times with {NUM_PLAYERS} player slots")
+            log.warning(f"No tee times with {NUM_PLAYERS} player slots — trying with fewer players")
+            best = await find_best_tee_time(tee_times, TARGET_TIME, 1)
+        if not best:
+            log.error("No tee times found at all")
             sys.exit(1)
 
         target_mins = time_to_minutes(TARGET_TIME)
@@ -748,472 +978,479 @@ async def main():
         log.info(f"  Difference from target: {diff} minutes")
         log.info("=" * 60)
 
-        if DRY_RUN:
-            elapsed = asyncio.get_event_loop().time() - start_time
-            log.info(f"DRY RUN complete in {elapsed:.1f}s - would book {best['time']}")
-            await asyncio.sleep(5)
-            return
-
-        # Step 6: Scroll back to top and click VIEW for the best time
-        await js("() => { window.scrollTo(0, 0); }")
-        await asyncio.sleep(1)
-
-        log.info(f"Clicking VIEW for {best['time']}...")
-
-        # First, let's understand what VIEW elements look like
-        view_debug = await js("""() => {
-            var allEls = document.querySelectorAll('*');
-            var viewEls = [];
-            for (var el of allEls) {
-                if (el.childNodes.length <= 2 && el.textContent.trim() === 'VIEW') {
-                    viewEls.push({
-                        tag: el.tagName,
-                        className: el.className,
-                        parentTag: el.parentElement ? el.parentElement.tagName : 'none',
-                        parentClass: el.parentElement ? el.parentElement.className : 'none',
-                    });
-                }
-            }
-            return JSON.stringify({count: viewEls.length, samples: viewEls.slice(0, 3)});
-        }""")
-        log.info(f"VIEW element structure: {view_debug}")
-
-        clicked = await js(f"""() => {{
-            // Find ALL elements with text "VIEW" (any tag)
-            var viewEls = [];
-            var allEls = document.querySelectorAll('a, button, span, div, label');
-            for (var el of allEls) {{
-                if (el.textContent.trim() === 'VIEW' || el.textContent.trim() === 'View') {{
-                    viewEls.push(el);
-                }}
-            }}
-
-            // For each VIEW element, check if a parent contains the target time
-            for (var btn of viewEls) {{
-                var parent = btn;
-                for (var i = 0; i < 8 && parent; i++) {{
-                    if (parent.innerText && parent.innerText.includes('{best["time"]}')) {{
-                        btn.click();
-                        return 'found_' + btn.tagName;
-                    }}
-                    parent = parent.parentElement;
-                }}
-            }}
-
-            // Fallback: just click the first VIEW element (it should be the closest to target after scroll to top)
-            if (viewEls.length > 0) {{
-                viewEls[0].click();
-                return 'fallback_first';
-            }}
-
-            return null;
-        }}""")
-
-        if not clicked:
-            log.error(f"Could not click VIEW for {best['time']}")
-            await screenshot("06_view_click_failed")
-            sys.exit(1)
-
-        log.info(f"VIEW clicked via '{clicked}' strategy")
-        await asyncio.sleep(5)
-        await screenshot("06_after_view_click")
-
-        # Dismiss any "Existing Reservation" or "Attention" dialogs
-        dismissed = await js("""() => {
-            var dismissed = 0;
-            var buttons = document.querySelectorAll('button');
-            for (var btn of buttons) {
-                if (btn.textContent.trim() === 'OK' && btn.offsetParent !== null) {
-                    btn.click();
-                    dismissed++;
-                }
-            }
-            return dismissed;
-        }""")
-        if dismissed:
-            log.info(f"Dismissed {dismissed} attention dialog(s)")
-            await asyncio.sleep(2)
-
-        # Dump page content to understand the booking page
-        booking_page = await js("() => document.body.innerText.substring(0, 2000)")
-        log.info(f"Booking page content:\n{booking_page}")
-
-        # Handle "Tee Time Adjustment" dialog — time was sniped by someone else
-        # Retry up to 5 times with next-best available time
+        # ---------------------------------------------------------------
+        # BOOKING FLOW WITH RETRY (up to 30 attempts)
+        # "Tee Time Adjustment" can appear at ANY step in the flow.
+        # On snipe: dismiss dialog, pick next best time, restart flow.
+        # ---------------------------------------------------------------
         tried_times = set()
-        MAX_RETRIES = 5
-        for attempt in range(MAX_RETRIES):
-            if "Tee Time Adjustment" not in booking_page and "no longer available" not in booking_page:
-                break  # No adjustment dialog — proceed with booking
+        MAX_ATTEMPTS = 30
+        target_minutes = time_to_minutes(TARGET_TIME)
 
-            tried_times.add(best['time'])
-            log.warning(f"Attempt {attempt + 1}/{MAX_RETRIES}: {best['time']} was taken! Got 'Tee Time Adjustment' dialog.")
+        async def wait_for_page_change(keyword, timeout=6):
+            """Poll rapidly for a keyword or dialog to appear. Returns page text."""
+            for _ in range(timeout * 4):  # poll every 250ms
+                text = await js("() => document.body.innerText.substring(0, 2000)")
+                if keyword in text or "Tee Time Adjustment" in text or "no longer available" in text:
+                    return text
+                await asyncio.sleep(0.25)
+            return await js("() => document.body.innerText.substring(0, 2000)")
 
-            # Click "No" to decline the alternative
-            declined = await js("""() => {
-                var buttons = document.querySelectorAll('button, a, input[type="button"]');
+        async def dismiss_dialogs():
+            """Dismiss OK/attention dialogs, then check for Tee Time Adjustment. Returns 'sniped', 'already_booked', or False."""
+            await js("""() => {
+                var buttons = document.querySelectorAll('button');
                 for (var btn of buttons) {
-                    if (btn.textContent.trim() === 'No' && btn.offsetParent !== null) {
-                        btn.click();
+                    if (btn.textContent.trim() === 'OK' && btn.offsetParent !== null) btn.click();
+                }
+            }""")
+            await asyncio.sleep(0.3)
+            page_text = await js("() => document.body.innerText.substring(0, 2000)")
+
+            # Check for existing reservation on this date
+            if "already" in page_text.lower() and ("reservation" in page_text.lower() or "booked" in page_text.lower() or "tee time" in page_text.lower()):
+                log.info("=" * 60)
+                log.info("Already have a reservation for this date — stopping gracefully")
+                log.info("=" * 60)
+                return "already_booked"
+
+            if "Tee Time Adjustment" in page_text or "no longer available" in page_text:
+                log.warning("Tee Time Adjustment detected — time was sniped!")
+                await js("""() => {
+                    var buttons = document.querySelectorAll('button');
+                    for (var btn of buttons) {
+                        if (btn.textContent.trim() === 'No' && btn.offsetParent !== null) btn.click();
+                    }
+                }""")
+                await asyncio.sleep(1)
+                return "sniped"
+            return False
+
+        async def ensure_on_search_page():
+            """Make sure we're on the tee time search page before retrying."""
+            page_text = await js("() => document.body.innerText.substring(0, 1000)")
+            if "VIEW" in page_text and "Pricing Options" in page_text:
+                return  # Already on search page
+            log.info("Navigating back to search page...")
+            # Close any open modals first
+            await js("""() => {
+                var closeBtns = document.querySelectorAll('.modal .close, .modal [data-dismiss="modal"], .modal button.close');
+                for (var btn of closeBtns) {
+                    if (btn.offsetParent !== null) btn.click();
+                }
+            }""")
+            await asyncio.sleep(0.5)
+            # Try clicking Cancel or Previous to go back
+            await js("""() => {
+                var links = document.querySelectorAll('a, button');
+                for (var el of links) {
+                    var text = el.textContent.trim().toLowerCase();
+                    if (text.includes('cancel') || text === '< previous' || text === 'back') {
+                        el.click();
                         return true;
                     }
                 }
                 return false;
             }""")
-            log.info(f"Declined alternative: {declined}")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
+            # Verify we're back — if not, use the URL hash
+            page_text = await js("() => document.body.innerText.substring(0, 1000)")
+            if "VIEW" not in page_text:
+                await js("() => { window.location.hash = '#/search'; }")
+                await asyncio.sleep(2)
+            await js("() => { window.scrollTo(0, 0); }")
 
-            # Pick the next best time we haven't tried yet
-            available_times = [t for t in tee_times if t['time'] not in tried_times]
-            if not available_times:
-                log.error("All tee times have been taken!")
-                await screenshot(f"06_no_alternatives_attempt{attempt + 1}")
-                sys.exit(1)
+        async def pick_next_best():
+            """Pick the next best time after a snipe. Returns False if none left."""
+            nonlocal best
+            tried_times.add(best['time'])
+            available = [t for t in tee_times if t['time'] not in tried_times]
+            if not available:
+                log.error("No more times to try!")
+                return False
+            best = min(available, key=lambda t: abs(time_to_minutes(t['time']) - target_minutes))
+            log.info(f"Next best time: {best['time']}")
+            await ensure_on_search_page()
+            return True
 
-            best = min(available_times, key=lambda t: abs(time_to_minutes(t['time']) - target_minutes))
-            log.info(f"Trying next best time: {best['time']}")
+        for attempt in range(MAX_ATTEMPTS):
+            log.info("=" * 60)
+            log.info(f"BOOKING ATTEMPT {attempt + 1}/{MAX_ATTEMPTS}: {best['time']}")
+            log.info("=" * 60)
 
-            # Click VIEW for the new time
-            retry_clicked = await js(f"""() => {{
-                var allEls = Array.from(document.querySelectorAll('*'));
-                var viewEls = allEls.filter(function(el) {{
-                    return el.textContent.trim() === 'VIEW' || el.textContent.trim() === 'View';
-                }});
-                for (var vel of viewEls) {{
-                    var parent = vel;
-                    for (var i = 0; i < 8; i++) {{
-                        if (!parent) break;
-                        if (parent.textContent.includes('{best["time"]}')) {{
-                            vel.click();
-                            return 'found_for_' + '{best["time"]}';
+            sniped = False
+
+            # Step 6: Scroll to the target time's VIEW button and click it
+            # First, try to scroll the target time into view, then match
+            log.info(f"Clicking VIEW for {best['time']}...")
+
+            # Try to scroll the target time card into view first
+            await js(f"""() => {{
+                var allEls = document.querySelectorAll('*');
+                for (var el of allEls) {{
+                    if (el.childNodes.length <= 3 && el.textContent.trim() === '{best["time"]}') {{
+                        el.scrollIntoView({{behavior: 'instant', block: 'center'}});
+                        return true;
+                    }}
+                }}
+                window.scrollTo(0, 0);
+                return false;
+            }}""")
+            await asyncio.sleep(0.3)
+
+            clicked = await js(f"""() => {{
+                var viewEls = [];
+                var allEls = document.querySelectorAll('a, button, span, div, label');
+                for (var el of allEls) {{
+                    var t = el.textContent.trim().toUpperCase();
+                    if (t === 'VIEW') viewEls.push(el);
+                }}
+                for (var btn of viewEls) {{
+                    var parent = btn;
+                    for (var i = 0; i < 10 && parent; i++) {{
+                        if (parent.innerText && parent.innerText.includes('{best["time"]}')) {{
+                            btn.click();
+                            return 'found_' + btn.tagName;
                         }}
                         parent = parent.parentElement;
                     }}
                 }}
-                if (viewEls.length > 0) {{
-                    viewEls[0].click();
-                    return 'found_BUTTON';
-                }}
                 return null;
             }}""")
 
-            if not retry_clicked:
-                log.error(f"Could not click VIEW for {best['time']}")
-                await screenshot(f"06_retry{attempt + 1}_view_failed")
-                sys.exit(1)
+            if not clicked:
+                log.warning(f"Could not match VIEW to '{best['time']}' — skipping to next best time")
+                if not await pick_next_best():
+                    break
+                continue
 
-            log.info(f"VIEW clicked via '{retry_clicked}'")
-            await asyncio.sleep(5)
-            await screenshot(f"06_retry{attempt + 1}_after_view")
+            log.info(f"VIEW clicked via '{clicked}'")
+            await wait_for_page_change("CHOOSE OPTION", timeout=5)
+            await screenshot(f"06_attempt{attempt+1}")
 
-            booking_page = await js("() => document.body.innerText.substring(0, 2000)")
-            log.info(f"Retry {attempt + 1} page content:\n{booking_page}")
-        else:
-            # Exhausted all retries
-            log.error(f"All {MAX_RETRIES} attempts failed — every time was sniped!")
-            await screenshot("06_all_retries_exhausted")
-            sys.exit(1)
+            # Check for snipe after VIEW
+            dialog_result = await dismiss_dialogs()
+            if dialog_result == "already_booked":
+                sys.exit(0)
+            if dialog_result:
+                if not await pick_next_best():
+                    break
+                continue
 
-        # Step 7: Select "Member Walk 18H" from the options modal
-        log.info("Selecting Member Walk 18H from options modal...")
-
-        # First, dump the modal DOM structure for debugging
-        modal_debug = await js("""() => {
-            // Find the modal
-            var modal = null;
-            var candidates = document.querySelectorAll('.modal, .modal-dialog, .modal-content, [class*="modal"], [class*="popup"], [class*="dialog"], [class*="overlay"]');
-            for (var el of candidates) {
-                if (el.innerText && el.innerText.includes('CHOOSE OPTION')) {
-                    modal = el;
-                    break;
-                }
-            }
-            if (!modal) {
-                var headers = document.querySelectorAll('*');
-                for (var h of headers) {
-                    if (h.textContent.trim().startsWith('CHOOSE OPTION')) {
-                        modal = h.parentElement;
-                        break;
-                    }
-                }
-            }
-            if (!modal) return JSON.stringify({error: 'no modal found'});
-
-            // Dump all clickable-looking elements in the modal
-            var info = {modalTag: modal.tagName, modalClass: modal.className};
-            var children = modal.querySelectorAll('*');
-            var rows = [];
-            children.forEach(function(el) {
-                var text = el.textContent.trim();
-                if (text.includes('Walk 18H') && !text.includes('Ride') && !text.includes('CHOOSE')) {
-                    rows.push({
-                        tag: el.tagName,
-                        className: el.className,
-                        text: text.substring(0, 80),
-                        childCount: el.childNodes.length,
-                        hasAnchor: el.querySelectorAll('a').length,
-                        hasButton: el.querySelectorAll('button').length,
-                        hasInput: el.querySelectorAll('input').length,
-                        isClickable: el.tagName === 'A' || el.tagName === 'BUTTON' || el.style.cursor === 'pointer' || el.onclick !== null,
-                        ngClick: el.getAttribute('ng-click') || el.getAttribute('data-ng-click') || '',
-                    });
-                }
-            });
-            info.walkRows = rows;
-
-            // Also get ALL direct children of the modal body to understand structure
-            var directRows = [];
-            // Look for the options container (usually a list/table)
-            var containers = modal.querySelectorAll('table, tbody, ul, ol, .modal-body, [class*="body"], [class*="options"], [class*="list"]');
-            containers.forEach(function(c) {
-                var cChildren = c.children;
-                for (var i = 0; i < cChildren.length && i < 10; i++) {
-                    var ch = cChildren[i];
-                    directRows.push({
-                        tag: ch.tagName,
-                        className: ch.className,
-                        text: ch.textContent.trim().substring(0, 60),
-                        ngClick: ch.getAttribute('ng-click') || ch.getAttribute('data-ng-click') || '',
-                    });
-                }
-            });
-            info.containerRows = directRows;
-
-            return JSON.stringify(info);
-        }""")
-        log.info(f"Modal structure: {modal_debug}")
-
-        # Now click the correct element
-        option_result = await js("""() => {
-            // Find the modal
-            var modal = null;
-            var candidates = document.querySelectorAll('.modal, .modal-dialog, .modal-content, [class*="modal"], [class*="popup"], [class*="dialog"], [class*="overlay"]');
-            for (var el of candidates) {
-                if (el.innerText && el.innerText.includes('CHOOSE OPTION')) {
-                    modal = el;
-                    break;
-                }
-            }
-            if (!modal) {
-                var headers = document.querySelectorAll('*');
-                for (var h of headers) {
-                    if (h.textContent.trim().startsWith('CHOOSE OPTION')) {
-                        modal = h.parentElement;
-                        break;
-                    }
-                }
-            }
-            if (!modal) return 'no_modal_found';
-
-            // Strategy 1: Find element with ng-click containing the Walk option
-            var ngClickEls = modal.querySelectorAll('[ng-click], [data-ng-click]');
-            for (var el of ngClickEls) {
-                var text = el.textContent.trim();
-                if (text.includes('Member Walk 18H') && !text.includes('Ride') && !text.includes('CHOOSE')) {
-                    el.click();
-                    return 'ng-click: ' + (el.getAttribute('ng-click') || el.getAttribute('data-ng-click'));
-                }
-            }
-
-            // Strategy 2: Find <a> or <button> elements inside a Walk 18H row
-            var allEls = modal.querySelectorAll('*');
-            for (var el of allEls) {
-                var text = el.textContent.trim();
-                if (text.includes('Member Walk 18H') && !text.includes('Ride') && !text.includes('CHOOSE') && !text.includes('9H')) {
-                    // Look for clickable children first
-                    var clickable = el.querySelector('a, button, input[type="radio"], input[type="checkbox"]');
-                    if (clickable) {
-                        clickable.click();
-                        return 'child_clickable: ' + clickable.tagName;
-                    }
-                    // If this element itself is a table row or list item, click it
-                    if (el.tagName === 'TR' || el.tagName === 'LI' || el.tagName === 'A' || el.tagName === 'BUTTON') {
+            # Step 7: Select Member Walk 18H
+            log.info("Selecting Member Walk 18H...")
+            await js("""() => {
+                var modal = document.querySelector('.modal-open') || document.body;
+                var ngClickEls = modal.querySelectorAll('[ng-click], [data-ng-click]');
+                for (var el of ngClickEls) {
+                    var text = el.textContent.trim();
+                    if (text.includes('Member Walk 18H') && !text.includes('Ride') && !text.includes('CHOOSE')) {
                         el.click();
-                        return 'direct_click: ' + el.tagName;
+                        return;
                     }
                 }
-            }
-
-            // Strategy 3: Find the exact leaf text node "Member Walk 18H" and click its parent
-            for (var el of allEls) {
-                if (el.childNodes.length <= 2 && el.textContent.trim() === 'Member Walk 18H') {
-                    // Click the nearest row-like ancestor
-                    var row = el.closest('tr, li, [ng-click], [data-ng-click], a, button');
-                    if (row) {
-                        row.click();
-                        return 'leaf_parent: ' + row.tagName;
+                var allEls = modal.querySelectorAll('*');
+                for (var el of allEls) {
+                    if (el.childNodes.length <= 2 && el.textContent.trim() === 'Member Walk 18H') {
+                        var row = el.closest('tr, li, [ng-click], [data-ng-click], a, button');
+                        if (row) { row.click(); return; }
+                        el.parentElement.click();
+                        return;
                     }
-                    // Click parent
-                    el.parentElement.click();
-                    return 'leaf_direct_parent: ' + el.parentElement.tagName;
                 }
-            }
+            }""")
+            await asyncio.sleep(1)
 
-            return 'walk_18h_not_clickable';
-        }""")
-        log.info(f"Option select result: {option_result}")
-        await asyncio.sleep(2)
-        await screenshot("07_after_option_select")
+            if DEBUG:
+                modal_state = await js("""() => {
+                    var modal = document.querySelector('.modal.in, .modal.show, .modal[style*="display: block"]');
+                    if (!modal) return JSON.stringify({error: 'no modal found'});
+                    var selected = modal.querySelector('.selected, .active, .highlighted, tr.info, tr.success, [class*="selected"]');
+                    var continueBtn = null;
+                    var buttons = modal.querySelectorAll('button, a, input[type="submit"]');
+                    for (var btn of buttons) {
+                        if (btn.textContent.trim() === 'Continue' && btn.offsetParent !== null) {
+                            continueBtn = {text: btn.textContent.trim(), disabled: btn.disabled, tag: btn.tagName, classes: btn.className};
+                        }
+                    }
+                    var selects = modal.querySelectorAll('select');
+                    var selectInfo = [];
+                    for (var s of selects) {
+                        selectInfo.push({id: s.id, name: s.name, value: s.value, options: Array.from(s.options).map(o => o.text.trim())});
+                    }
+                    return JSON.stringify({
+                        selectedEl: selected ? selected.innerText.substring(0, 100) : null,
+                        continueBtn: continueBtn,
+                        selects: selectInfo,
+                        modalText: modal.innerText.substring(0, 500)
+                    });
+                }""")
+                log.info(f"Modal state after pricing selection: {modal_state}")
+            await screenshot(f"06b_after_pricing_select_attempt{attempt+1}")
 
-        # Check if modal is still showing or if we navigated
-        page_after_option = await js("() => document.body.innerText.substring(0, 500)")
-        log.info(f"After option select:\n{page_after_option}")
-
-        # Set # of Players in the modal to match our target
-        log.info(f"Setting modal player count to {NUM_PLAYERS}...")
-        modal_players = await js(f"""() => {{
-            // Find the "# of Players" dropdown in the modal
-            var selects = document.querySelectorAll('select');
-            for (var sel of selects) {{
-                // Check if this select is for players (look at label or options)
-                var label = sel.closest('.form-group, .row, div')?.querySelector('label');
-                var isPlayerSelect = (label && label.textContent.includes('Player')) ||
-                    sel.id.toLowerCase().includes('player') ||
-                    sel.name?.toLowerCase().includes('player');
-
-                // Also check by option values — player selects have 1,2,3,4
-                if (!isPlayerSelect) {{
+            # Set 4 players in modal
+            log.info(f"Setting modal players to {NUM_PLAYERS}...")
+            await js(f"""() => {{
+                var selects = document.querySelectorAll('select');
+                for (var sel of selects) {{
                     var opts = Array.from(sel.options).map(o => o.text.trim());
-                    if (opts.includes('1 player') || opts.includes('2 players') ||
-                        (opts.includes('1') && opts.includes('2') && opts.includes('3') && opts.includes('4'))) {{
-                        isPlayerSelect = true;
-                    }}
-                }}
-
-                if (isPlayerSelect) {{
-                    // Find the option matching our player count
-                    for (var opt of sel.options) {{
-                        if (opt.text.trim() === '{NUM_PLAYERS} players' || opt.text.trim() === '{NUM_PLAYERS}') {{
-                            sel.value = opt.value;
-                            sel.dispatchEvent(new Event('change', {{bubbles: true}}));
-                            try {{ angular.element(sel).triggerHandler('change'); }} catch(e) {{}}
-                            return 'set_to_{NUM_PLAYERS}';
+                    if (opts.includes('1 player') || opts.includes('2 players')) {{
+                        for (var opt of sel.options) {{
+                            if (opt.text.trim() === '{NUM_PLAYERS} players' || opt.text.trim() === '{NUM_PLAYERS}') {{
+                                sel.value = opt.value;
+                                sel.dispatchEvent(new Event('change', {{bubbles: true}}));
+                                try {{ angular.element(sel).triggerHandler('change'); }} catch(e) {{}}
+                                return;
+                            }}
                         }}
                     }}
                 }}
-            }}
-            return 'no_player_select_found';
-        }}""")
-        log.info(f"Modal player select result: {modal_players}")
-        await asyncio.sleep(1)
+            }}""")
+            await asyncio.sleep(0.5)
 
-        # If still on modal (Continue button needed), click it
-        log.info("Looking for Continue button...")
-        continued = await js("""() => {
-            // First try visible Continue buttons
-            var buttons = document.querySelectorAll('button, a, input[type="submit"]');
-            for (var btn of buttons) {
-                var text = btn.textContent.trim();
-                if (text === 'Continue' && btn.offsetParent !== null) {
-                    btn.click();
-                    return 'visible';
-                }
-            }
-            // Try any Continue button
-            for (var btn of buttons) {
-                var text = btn.textContent.trim();
-                if (text === 'Continue') {
-                    btn.click();
-                    return 'any';
-                }
-            }
-            return false;
-        }""")
-        log.info(f"Continue button result: {continued}")
-        await asyncio.sleep(5)
-        await screenshot("07b_after_continue")
+            if DEBUG:
+                modal_state2 = await js("""() => {
+                    var modal = document.querySelector('.modal.in, .modal.show, .modal[style*="display: block"]');
+                    if (!modal) return JSON.stringify({error: 'no modal found'});
+                    var buttons = modal.querySelectorAll('button, a, input[type="submit"]');
+                    var allBtns = [];
+                    for (var btn of buttons) {
+                        if (btn.offsetParent !== null) {
+                            allBtns.push({text: btn.textContent.trim(), disabled: btn.disabled, tag: btn.tagName, classes: btn.className.substring(0, 60)});
+                        }
+                    }
+                    return JSON.stringify({buttons: allBtns, modalText: modal.innerText.substring(0, 500)});
+                }""")
+                log.info(f"Modal state after players: {modal_state2}")
+            await screenshot(f"06c_after_players_attempt{attempt+1}")
 
-        # Check what page we're on now - should be "Verify Details"
-        page_content = await js("() => document.body.innerText.substring(0, 1500)")
-        log.info(f"After continue:\n{page_content}")
-
-        # Step 8: On Verify Details page, click CONTINUE to proceed to final confirmation
-        log.info("Looking for CONTINUE on Verify Details page...")
-        verify_continue = await js("""() => {
-            var buttons = document.querySelectorAll('button, a, input[type="submit"]');
-            for (var btn of buttons) {
-                var text = btn.textContent.trim();
-                if ((text === 'Continue' || text === 'CONTINUE') && btn.offsetParent !== null) {
-                    btn.click();
-                    return text;
-                }
-            }
-            return null;
-        }""")
-        log.info(f"Verify Details Continue result: {verify_continue}")
-        await asyncio.sleep(5)
-        await screenshot("08_after_verify_continue")
-
-        # Dismiss any "Existing Reservation" dialogs on final page
-        dismissed2 = await js("""() => {
-            var dismissed = 0;
-            var buttons = document.querySelectorAll('button');
-            for (var btn of buttons) {
-                if (btn.textContent.trim() === 'OK' && btn.offsetParent !== null) {
-                    btn.click();
-                    dismissed++;
-                }
-            }
-            return dismissed;
-        }""")
-        if dismissed2:
-            log.info(f"Dismissed {dismissed2} attention dialog(s) on final page")
-            await asyncio.sleep(2)
-
-        # Check final page
-        final_content = await js("() => document.body.innerText.substring(0, 1500)")
-        log.info(f"Final page content:\n{final_content}")
-
-        # Step 9: Look for final Book/Confirm button
-        log.info("Looking for final booking button...")
-        all_buttons = await js("""() => {
-            var buttons = document.querySelectorAll('a, button, input[type="submit"]');
-            var result = [];
-            buttons.forEach(function(btn) {
-                var text = btn.textContent.trim();
-                if (text && text.length < 50 && btn.offsetParent !== null) {
-                    result.push({text: text, tag: btn.tagName, type: btn.type || ''});
-                }
-            });
-            return JSON.stringify(result);
-        }""")
-        log.info(f"Visible buttons: {all_buttons}")
-
-        booked = await js("""() => {
-            var buttons = document.querySelectorAll('a, button, input[type="submit"]');
-            var bookWords = ['book', 'reserve', 'confirm', 'complete', 'submit', 'finish'];
-            for (var btn of buttons) {
-                var text = btn.textContent.trim().toLowerCase();
-                if (btn.offsetParent === null) continue;
-                for (var word of bookWords) {
-                    if (text.includes(word) && !text.includes('cancel')) {
+            # Click Continue in CHOOSE OPTIONS modal — single clean click only
+            log.info("Clicking Continue...")
+            continue_result = await js("""() => {
+                var buttons = document.querySelectorAll('button, a, input[type="submit"]');
+                for (var btn of buttons) {
+                    if (btn.textContent.trim() === 'Continue' && btn.offsetParent !== null) {
                         btn.click();
-                        return text;
+                        return 'clicked_' + btn.tagName + '_' + btn.className;
                     }
                 }
-            }
-            return null;
-        }""")
+                return 'no_button_found';
+            }""")
+            log.info(f"Continue click result: {continue_result}")
 
-        if booked:
-            log.info(f"Clicked final booking button: '{booked}'")
-            await asyncio.sleep(5)
-            await screenshot("09_after_book_click")
+            # Give the page time to transition — Verify Details takes 3-5 seconds to load
+            page_after_continue = await wait_for_page_change("Verify Details", timeout=10)
+            await screenshot(f"06d_after_continue_attempt{attempt+1}")
+
+            # Check for snipe after Continue
+            dialog_result = await dismiss_dialogs()
+            if dialog_result == "already_booked":
+                sys.exit(0)
+            if dialog_result:
+                if not await pick_next_best():
+                    break
+                continue
+
+            # Check where we landed after Continue
+            page_state = await js("""() => {
+                var body = document.body.innerText.substring(0, 2000);
+                if (body.includes('Verify Details')) return 'verify_details';
+                if (body.includes('Finish') && body.includes('Reservation')) return 'finish';
+                var modal = document.querySelector('.modal.in, .modal.show, .modal[style*="display: block"]');
+                if (modal && modal.offsetParent !== null && modal.innerText.includes('CHOOSE OPTION')) return 'still_in_modal';
+                if (body.includes('Sign In') && !body.includes('Sign Out') && !body.includes('My Account')) return 'logged_out';
+                return 'unknown: ' + body.substring(0, 200);
+            }""")
+            log.info(f"Page state after Continue: {page_state}")
+
+            if page_state == 'logged_out':
+                log.error("Session lost — logged out after Continue click")
+                sys.exit(1)
+
+            if page_state == 'still_in_modal':
+                log.warning(f"Still in CHOOSE OPTIONS modal after Continue — skipping to next time.")
+                await js("""() => {
+                    var closeBtn = document.querySelector('.modal .close, .modal [data-dismiss="modal"], .modal button.close');
+                    if (closeBtn && closeBtn.offsetParent !== null) closeBtn.click();
+                }""")
+                await asyncio.sleep(0.5)
+                if not await pick_next_best():
+                    break
+                continue
+
+            if page_state.startswith('unknown'):
+                # Page might still be loading — wait a bit more
+                log.info("Page still loading, waiting...")
+                await asyncio.sleep(3)
+                page_state = await js("""() => {
+                    var body = document.body.innerText.substring(0, 2000);
+                    if (body.includes('Verify Details')) return 'verify_details';
+                    if (body.includes('Finish') && body.includes('Reservation')) return 'finish';
+                    return 'still_unknown: ' + body.substring(0, 200);
+                }""")
+                log.info(f"Page state after extra wait: {page_state}")
+
+            if not page_state.startswith('verify') and not page_state.startswith('finish'):
+                log.warning(f"Unexpected page state: {page_state} — skipping to next time")
+                if not await pick_next_best():
+                    break
+                continue
+
+            # Step 8: Click CONTINUE on Verify Details page
+            # Dismiss any stale modal overlays first
+            await js("""() => {
+                var closeBtn = document.querySelector('.modal .close, .modal [data-dismiss="modal"], .modal button.close');
+                if (closeBtn && closeBtn.offsetParent !== null) closeBtn.click();
+            }""")
+            await asyncio.sleep(0.3)
+
+            log.info("Clicking CONTINUE on Verify Details...")
+            await js("""() => {
+                // Click the LAST visible Continue — the one on Verify Details, not a stale modal
+                var buttons = document.querySelectorAll('button, a, input[type="submit"]');
+                var lastContinue = null;
+                for (var btn of buttons) {
+                    var text = btn.textContent.trim();
+                    if ((text === 'Continue' || text === 'CONTINUE') && btn.offsetParent !== null) {
+                        lastContinue = btn;
+                    }
+                }
+                if (lastContinue) lastContinue.click();
+            }""")
+            page_after_verify = await wait_for_page_change("Finish", timeout=5)
+
+            # Check for snipe after Verify Details
+            dialog_result = await dismiss_dialogs()
+            if dialog_result == "already_booked":
+                sys.exit(0)
+            if dialog_result:
+                if not await pick_next_best():
+                    break
+                continue
+
+            # Verify we actually reached the Finish page
+            if "Finish" not in page_after_verify and "Pricing Options" in page_after_verify:
+                log.warning("Bounced back to Pricing Options after Verify Details Continue — retrying with next time")
+                if not await pick_next_best():
+                    break
+                continue
+
+            # Step 9: Click Finish Reservation
+            final_content = await js("() => document.body.innerText.substring(0, 1500)")
+            log.info(f"Final page:\n{final_content}")
+
+            # Verify we're actually on the Finish page
+            has_finish = await js("""() => {
+                var buttons = document.querySelectorAll('a, button, input[type="submit"]');
+                var bookWords = ['book', 'reserve', 'confirm', 'complete', 'submit', 'finish'];
+                for (var btn of buttons) {
+                    var text = btn.textContent.trim().toLowerCase();
+                    if (btn.offsetParent === null) continue;
+                    for (var word of bookWords) {
+                        if (text.includes(word) && !text.includes('cancel')) {
+                            return text;
+                        }
+                    }
+                }
+                return null;
+            }""")
+
+            if not has_finish:
+                log.warning("Could not find final booking button")
+                await screenshot(f"09_attempt{attempt+1}_no_book")
+                dialog_result = await dismiss_dialogs()
+                if dialog_result == "already_booked":
+                    sys.exit(0)
+                if not await pick_next_best():
+                    log.error("No more times to try — giving up")
+                    break
+                continue
+
+            if DRY_RUN:
+                total_elapsed = asyncio.get_event_loop().time() - start_time
+                log.info("=" * 60)
+                log.info(f"DRY RUN — stopping before Finish Reservation")
+                log.info(f"Would book: {best['time']} on {target_day_str}")
+                log.info(f"Players: {NUM_PLAYERS}")
+                log.info(f"Final button found: '{has_finish}'")
+                log.info(f"Total elapsed time: {total_elapsed:.1f}s")
+                log.info("=" * 60)
+                await screenshot("09_dry_run_finish_page")
+                # Cancel to back out cleanly
+                await js("""() => {
+                    var links = document.querySelectorAll('a, button');
+                    for (var el of links) {
+                        var text = el.textContent.trim().toLowerCase();
+                        if (text.includes('cancel') || text === '< previous') {
+                            el.click();
+                            return;
+                        }
+                    }
+                }""")
+                await asyncio.sleep(2)
+                break
+
+            log.info("Looking for final booking button...")
+            booked = await js("""() => {
+                var buttons = document.querySelectorAll('a, button, input[type="submit"]');
+                var bookWords = ['book', 'reserve', 'confirm', 'complete', 'submit', 'finish'];
+                for (var btn of buttons) {
+                    var text = btn.textContent.trim().toLowerCase();
+                    if (btn.offsetParent === null) continue;
+                    for (var word of bookWords) {
+                        if (text.includes(word) && !text.includes('cancel')) {
+                            btn.click();
+                            return text;
+                        }
+                    }
+                }
+                return null;
+            }""")
+
+            if booked:
+                log.info(f"Clicked final booking button: '{booked}'")
+                await wait_for_page_change("Reservation Complete", timeout=5)
+                await screenshot("09_after_book_click")
+
+                # Verify it actually worked (check for confirmation)
+                confirmation = await js("() => document.body.innerText.substring(0, 2000)")
+                if "Reservation Complete" in confirmation or "Confirmation" in confirmation:
+                    total_elapsed = asyncio.get_event_loop().time() - start_time
+                    log.info("=" * 60)
+                    log.info(f"BOOKING SUCCESSFUL!")
+                    log.info(f"Time: {best['time']} on {target_day_str}")
+                    log.info(f"Players: {NUM_PLAYERS}")
+                    log.info(f"Total elapsed time: {total_elapsed:.1f}s")
+                    log.info("=" * 60)
+                    log.info(f"Page content:\n{confirmation}")
+                    break  # SUCCESS!
+                elif "Tee Time Adjustment" in confirmation or "no longer available" in confirmation:
+                    log.warning("Sniped AFTER clicking Finish!")
+                    await js("""() => {
+                        var buttons = document.querySelectorAll('button');
+                        for (var btn of buttons) {
+                            if (btn.textContent.trim() === 'No' && btn.offsetParent !== null) btn.click();
+                        }
+                    }""")
+                    await asyncio.sleep(1)
+                    if not await pick_next_best():
+                        break
+                    continue
+                else:
+                    # Assume success if no error detected
+                    total_elapsed = asyncio.get_event_loop().time() - start_time
+                    log.info("=" * 60)
+                    log.info(f"BOOKING FLOW COMPLETED!")
+                    log.info(f"Time: {best['time']} on {target_day_str}")
+                    log.info(f"Total elapsed time: {total_elapsed:.1f}s")
+                    log.info("=" * 60)
+                    log.info(f"Page content:\n{confirmation}")
+                    break
         else:
-            log.error("Could not find final booking button")
-            await screenshot("09_no_book_button")
+            # Exhausted all attempts
+            log.error(f"All {MAX_ATTEMPTS} booking attempts failed!")
+            await screenshot("09_all_attempts_failed")
             sys.exit(1)
-
-        await asyncio.sleep(5)
-        elapsed = asyncio.get_event_loop().time() - start_time
-        log.info("=" * 60)
-        log.info(f"BOOKING FLOW COMPLETED in {elapsed:.1f}s!")
-        log.info(f"Time: {best['time']} on {target_day_str}")
-        log.info(f"Players: {NUM_PLAYERS}")
-        log.info("=" * 60)
-
-        confirmation = await js("() => document.body.innerText.substring(0, 2000)")
-        log.info(f"Page content:\n{confirmation}")
 
     except Exception as e:
         log.exception(f"Error: {e}")
@@ -1225,4 +1462,16 @@ async def main():
 
 
 if __name__ == "__main__":
+    import warnings
+    warnings.filterwarnings("ignore", category=ResourceWarning, message="unclosed transport")
+    # Suppress Windows asyncio pipe cleanup noise (ValueError during __del__)
+    if sys.platform == "win32":
+        _original_del = getattr(asyncio.proactor_events._ProactorBasePipeTransport, "__del__", None)
+        if _original_del:
+            def _silent_del(self):
+                try:
+                    _original_del(self)
+                except (ValueError, OSError):
+                    pass
+            asyncio.proactor_events._ProactorBasePipeTransport.__del__ = _silent_del
     asyncio.run(main())
