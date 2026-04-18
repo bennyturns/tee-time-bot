@@ -14,8 +14,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -53,6 +56,13 @@ GROUP_ID = int(os.getenv("GROUP_ID", "27848"))
 
 DRY_RUN = "--dry-run" in sys.argv
 DEBUG = "--debug" in sys.argv
+
+# Stale-result recovery: re-search after this many consecutive "no longer available" failures
+RE_SEARCH_THRESHOLD = int(os.getenv("RE_SEARCH_THRESHOLD", "3"))
+# Accept API-suggested alternative times if before this minute-of-day (720 = noon)
+MAX_ALT_TIME_MINS = int(os.getenv("MAX_ALT_TIME_MINS", "720"))
+# Number of time slots to try in parallel on the first booking wave
+PARALLEL_SLOTS = int(os.getenv("PARALLEL_SLOTS", "3"))
 
 # Set up logging — logs/ directory with daily rotation
 _log_dir = Path(__file__).parent / "logs"
@@ -106,6 +116,17 @@ def time_to_minutes(time_str: str) -> int:
         return h * 60 + m
     parts = time_str.split(":")
     return int(parts[0]) * 60 + int(parts[1])
+
+
+def parse_alternative_time(error_msg):
+    """Extract alternative time from cart error like 'We found a <b>Apr 26 2026  9:24AM</b>'.
+
+    Returns the time string (e.g. '9:24AM') or None if not found.
+    """
+    match = re.search(r'We found a\s*<b>[^<]*?\s+(\d{1,2}:\d{2}\s*[AP]M)</b>', error_msg, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return None
 
 
 def minutes_to_time(mins: int) -> str:
@@ -429,10 +450,11 @@ def get_reservation_details(session, time_slot, session_id):
 
 
 def add_to_cart(session, preferred_entry, rate_info, num_players, contact_id, session_id, csrf_token):
-    """Add selected tee time to cart. Returns cart response.
+    """Add selected tee time to cart.
 
-    preferred_entry: the tee time entry for our preferred rate type
-    rate_info: the reservation details for that rate (from get_reservation_details)
+    Returns (cart_response, error_message).
+    On success: (response_dict, None)
+    On failure: (None, status_message_string_or_None)
     """
     # Find the matching rate info for our preferred sponsor
     selected_rate = None
@@ -445,7 +467,7 @@ def add_to_cart(session, preferred_entry, rate_info, num_players, contact_id, se
         selected_rate = rate_info[0] if rate_info else None
     if not selected_rate:
         log.error("No rate info available")
-        return None
+        return None, None
 
     log.info(f"Step 5: Adding to cart ({selected_rate.get('r01', '?')})...")
     cart_resp = api_post(session, "/api/cart/add", {
@@ -461,13 +483,91 @@ def add_to_cart(session, preferred_entry, rate_info, num_players, contact_id, se
     }, "add to cart")
 
     if not cart_resp:
-        return None
+        return None, None
 
     if not cart_resp.get("IsSuccessful"):
-        log.error(f"Cart add failed: {cart_resp.get('StatusMessage', 'unknown error')}")
-        return None
+        error_msg = cart_resp.get('StatusMessage', 'unknown error')
+        log.error(f"Cart add failed: {error_msg}")
+        return None, error_msg
 
-    return cart_resp
+    return cart_resp, None
+
+
+def try_book_slot(session, slot, session_id, csrf_token, contact_id, num_players, success_event):
+    """Try to book a single slot: reservation details → cart/add.
+
+    Checks success_event before calling cart/add — if another thread already
+    won, this thread skips the cart/add to avoid holding extra tee times.
+
+    Returns (slot, cart_resp, error_msg).
+    """
+    display_time = slot["display_time"]
+    preferred_entry = get_preferred_entry(slot, PREFERRED_SPONSOR_ID)
+    if not preferred_entry:
+        return slot, None, "no preferred entry"
+
+    log.info(f"  [stagger] {display_time}: getting reservation details...")
+
+    rate_info = get_reservation_details(session, slot, session_id)
+    if not rate_info:
+        return slot, None, "reservation details failed"
+
+    # Check if another thread already succeeded — skip cart/add if so
+    if success_event.is_set():
+        log.info(f"  [stagger] {display_time}: another slot already won, skipping cart/add")
+        return slot, None, "skipped — another slot won"
+
+    log.info(f"  [stagger] {display_time}: adding to cart...")
+    cart_resp, error_msg = add_to_cart(
+        session, preferred_entry, rate_info, num_players,
+        contact_id, session_id, csrf_token,
+    )
+    if cart_resp:
+        success_event.set()  # signal other threads to skip
+    return slot, cart_resp, error_msg
+
+
+# Delay between staggered slot launches (seconds)
+STAGGER_DELAY = float(os.getenv("STAGGER_DELAY", "0.5"))
+
+
+def staggered_book_slots(session, slots, session_id, csrf_token, contact_id, num_players):
+    """Fire reservation + cart/add for slots with staggered starts.
+
+    Launches each slot STAGGER_DELAY apart. A shared Event prevents later
+    slots from calling cart/add once an earlier slot succeeds, so at most
+    one tee time is held under normal conditions.
+
+    Returns (winning_slot, cart_resp, failures).
+    """
+    success_event = threading.Event()
+    failures = []
+
+    with ThreadPoolExecutor(max_workers=len(slots)) as pool:
+        futures = {}
+        for i, slot in enumerate(slots):
+            if success_event.is_set():
+                log.info(f"  [stagger] Skipping {slot['display_time']} — already have a winner")
+                break
+            futures[pool.submit(
+                try_book_slot, session, slot,
+                session_id, csrf_token, contact_id, num_players,
+                success_event,
+            )] = slot
+            # Stagger: wait before launching next slot (except after the last one)
+            if i < len(slots) - 1:
+                time.sleep(STAGGER_DELAY)
+
+        for future in as_completed(futures):
+            slot, cart_resp, error_msg = future.result()
+            if cart_resp:
+                log.info(f"  [stagger] Winner: {slot['display_time']}")
+                return slot, cart_resp, failures
+            else:
+                failures.append((slot, error_msg))
+                log.info(f"  [stagger] Failed: {slot['display_time']} — {error_msg or 'unknown'}")
+
+    return None, None, failures
 
 
 def hold_reservation(session, contact_id, session_id):
@@ -652,102 +752,185 @@ async def main():
     log.info(f"Login + search completed in {search_elapsed*1000:.0f}ms")
 
     # ---------------------------------------------------------------
-    # Booking loop with retry
+    # Booking: parallel race then sequential fallback with re-search
     # ---------------------------------------------------------------
     tried_datetimes = set()
-    MAX_ATTEMPTS = 10
+    MAX_ATTEMPTS = 15
+    booking_start = time.time()
+    booked = False
 
-    for attempt in range(MAX_ATTEMPTS):
-        best_slot = find_best_time_slot(time_slots, TARGET_TIME, NUM_PLAYERS, tried_datetimes)
-        if not best_slot:
-            log.error("No more eligible time slots to try!")
+    # --- Wave 1: Race top PARALLEL_SLOTS slots simultaneously ---
+    race_candidates = []
+    for _ in range(PARALLEL_SLOTS):
+        slot = find_best_time_slot(time_slots, TARGET_TIME, NUM_PLAYERS, tried_datetimes)
+        if not slot:
             break
+        race_candidates.append(slot)
+        tried_datetimes.add(slot["datetime"])
 
-        display_time = best_slot["display_time"]
-        preferred_entry = get_preferred_entry(best_slot, PREFERRED_SPONSOR_ID)
+    best_slot = None
+    cart_resp = None
+    attempts_used = 0
+
+    if race_candidates:
         log.info("=" * 60)
-        log.info(f"BOOKING ATTEMPT {attempt + 1}/{MAX_ATTEMPTS}: {display_time}")
-        log.info(f"  DateTime: {best_slot['datetime']}")
-        log.info(f"  Available: {best_slot['available_players']} players")
-        log.info(f"  Rate entries: {len(best_slot['entries'])}")
-        log.info(f"  Preferred entry UUID: {preferred_entry['r01'] if preferred_entry else '?'}")
-        log.info(f"  Price: ${preferred_entry['r08'] if preferred_entry else '?'}")
+        log.info(f"STAGGERED RACE: {len(race_candidates)} slots, {STAGGER_DELAY:.1f}s apart")
+        for rc in race_candidates:
+            pe = get_preferred_entry(rc, PREFERRED_SPONSOR_ID)
+            log.info(f"  {rc['display_time']} — {rc['available_players']}p — ${pe['r08'] if pe else '?'}")
         log.info("=" * 60)
 
-        booking_start = time.time()
+        winning_slot, cart_resp, failures = staggered_book_slots(
+            session, race_candidates, session_id, csrf_token, contact_id, NUM_PLAYERS,
+        )
+        attempts_used = len(race_candidates)
 
-        # Get reservation details
-        rate_info = get_reservation_details(session, best_slot, session_id)
-        if not rate_info:
-            log.warning("Failed to get reservation details — trying next time")
-            tried_datetimes.add(best_slot["datetime"])
-            continue
+        if cart_resp:
+            best_slot = winning_slot
+        else:
+            log.warning(f"Parallel race: all {len(race_candidates)} slots failed")
+            # Check failures for alternative time hints
+            for failed_slot, error_msg in failures:
+                if error_msg:
+                    alt_time_str = parse_alternative_time(error_msg)
+                    if alt_time_str:
+                        alt_mins = time_to_minutes(alt_time_str)
+                        if alt_mins < MAX_ALT_TIME_MINS:
+                            log.info(f"API suggests {alt_time_str} — re-searching for fresh results")
+                            tee_times, rate_types = search_tee_times(session, target_date_str, NUM_PLAYERS)
+                            if tee_times:
+                                time_slots = group_tee_times(tee_times)
+                                tried_datetimes.clear()
+                                log.info(f"Re-search found {len(time_slots)} time slots")
+                            break
+                        else:
+                            log.info(f"API suggests {alt_time_str} — too late (after {minutes_to_time(MAX_ALT_TIME_MINS)})")
 
-        # Add to cart
-        cart_resp = add_to_cart(session, preferred_entry, rate_info, NUM_PLAYERS, contact_id, session_id, csrf_token)
-        if not cart_resp:
-            log.warning("Failed to add to cart — time may be taken, trying next")
-            tried_datetimes.add(best_slot["datetime"])
-            continue
+    # --- Wave 2: Sequential fallback with re-search recovery ---
+    if not cart_resp:
+        consecutive_stale = 0
+        for attempt in range(attempts_used, MAX_ATTEMPTS):
+            if consecutive_stale >= RE_SEARCH_THRESHOLD:
+                log.info(f"Re-searching after {consecutive_stale} consecutive stale failures...")
+                tee_times, rate_types = search_tee_times(session, target_date_str, NUM_PLAYERS)
+                if tee_times:
+                    time_slots = group_tee_times(tee_times)
+                    log.info(f"Re-search found {len(time_slots)} time slots")
+                    tried_datetimes.clear()
+                else:
+                    log.warning("Re-search returned no results, continuing with existing data")
+                consecutive_stale = 0
 
-        # Hold reservation
-        hold_resp = hold_reservation(session, contact_id, session_id)
-        if not hold_resp:
-            log.warning("Failed to hold reservation — trying next time")
-            tried_datetimes.add(best_slot["datetime"])
-            continue
+            slot = find_best_time_slot(time_slots, TARGET_TIME, NUM_PLAYERS, tried_datetimes)
+            if not slot:
+                log.error("No more eligible time slots to try!")
+                break
 
-        # Check conflicts
-        conflict_resp = check_conflicts(session, preferred_entry, contact_id)
-        if conflict_resp and conflict_resp.get("CaptainTeeTimeConflictsFound"):
-            log.warning("Tee time conflict detected — you may already have a booking")
-
-        if DRY_RUN:
-            booking_elapsed = time.time() - booking_start
-            total_elapsed = time.time() - overall_start
+            display_time = slot["display_time"]
+            preferred_entry = get_preferred_entry(slot, PREFERRED_SPONSOR_ID)
             log.info("=" * 60)
-            log.info(f"DRY RUN — stopping before finish")
-            log.info(f"Would book: {display_time} on {target_day_str}")
-            log.info(f"Players: {NUM_PLAYERS}")
-            log.info("-" * 60)
-            log.info(f"  Cloudflare:       {cf_elapsed:.1f}s")
-            log.info(f"  Login + Search:   {search_elapsed:.1f}s")
-            log.info(f"  Booking:          {booking_elapsed:.1f}s")
-            log.info(f"  TOTAL:            {total_elapsed:.1f}s")
+            log.info(f"BOOKING ATTEMPT {attempt + 1}/{MAX_ATTEMPTS}: {display_time}")
+            log.info(f"  DateTime: {slot['datetime']}")
+            log.info(f"  Available: {slot['available_players']} players")
+            log.info(f"  Preferred entry UUID: {preferred_entry['r01'] if preferred_entry else '?'}")
+            log.info(f"  Price: ${preferred_entry['r08'] if preferred_entry else '?'}")
             log.info("=" * 60)
-            break
 
-        # Finish booking
-        finish_resp = finish_booking(session, contact_id, session_id)
-        if not finish_resp:
-            log.warning("Finish call failed — trying next time")
-            tried_datetimes.add(best_slot["datetime"])
-            continue
+            rate_info = get_reservation_details(session, slot, session_id)
+            if not rate_info:
+                log.warning("Failed to get reservation details — trying next time")
+                tried_datetimes.add(slot["datetime"])
+                continue
 
-        if finish_resp.get("IsSuccessful"):
-            booking_elapsed = time.time() - booking_start
-            total_elapsed = time.time() - overall_start
-            log.info("=" * 60)
-            log.info("BOOKING SUCCESSFUL!")
-            log.info(f"  Time: {display_time} on {target_day_str}")
-            log.info(f"  Confirmation: {finish_resp.get('ConfirmationNumber', '?')}")
-            log.info(f"  Location: {finish_resp.get('Location', '?')}")
-            log.info(f"  Players: {finish_resp.get('NumberOfPlayers', '?')}")
-            log.info(f"  Total Price: ${finish_resp.get('TotalPrice', '?')}")
-            log.info(f"  Cancel By: {finish_resp.get('CancellationDeadline', '?')}")
-            log.info("-" * 60)
-            log.info(f"  Cloudflare:       {cf_elapsed:.1f}s")
-            log.info(f"  Login + Search:   {search_elapsed:.1f}s")
-            log.info(f"  Booking:          {booking_elapsed:.1f}s")
-            log.info(f"  TOTAL:            {total_elapsed:.1f}s")
-            log.info("=" * 60)
+            resp, error_msg = add_to_cart(
+                session, preferred_entry, rate_info, NUM_PLAYERS,
+                contact_id, session_id, csrf_token,
+            )
+            if not resp:
+                tried_datetimes.add(slot["datetime"])
+
+                if error_msg:
+                    alt_time_str = parse_alternative_time(error_msg)
+                    if alt_time_str:
+                        alt_mins = time_to_minutes(alt_time_str)
+                        if alt_mins < MAX_ALT_TIME_MINS:
+                            log.info(f"API suggests {alt_time_str} — re-searching for fresh results")
+                            tee_times, rate_types = search_tee_times(session, target_date_str, NUM_PLAYERS)
+                            if tee_times:
+                                time_slots = group_tee_times(tee_times)
+                                tried_datetimes.clear()
+                                consecutive_stale = 0
+                                log.info(f"Re-search found {len(time_slots)} time slots")
+                            continue
+                        else:
+                            log.info(f"API suggests {alt_time_str} — too late (after {minutes_to_time(MAX_ALT_TIME_MINS)})")
+
+                consecutive_stale += 1
+                log.warning(f"Failed to add to cart — trying next (stale streak: {consecutive_stale})")
+                continue
+
+            best_slot = slot
+            cart_resp = resp
+            consecutive_stale = 0
             break
         else:
-            log.warning(f"Booking failed: {finish_resp.get('StatusText', 'unknown')}")
-            tried_datetimes.add(best_slot["datetime"])
-            continue
+            log.error(f"All {MAX_ATTEMPTS} booking attempts failed!")
+            sys.exit(1)
+
+    if not cart_resp or not best_slot:
+        log.error("No booking succeeded!")
+        sys.exit(1)
+
+    # --- Finalize the winning slot ---
+    display_time = best_slot["display_time"]
+    preferred_entry = get_preferred_entry(best_slot, PREFERRED_SPONSOR_ID)
+
+    # Hold reservation
+    hold_resp = hold_reservation(session, contact_id, session_id)
+    if not hold_resp:
+        log.error("Failed to hold reservation after successful cart add!")
+        sys.exit(1)
+
+    # Check conflicts
+    conflict_resp = check_conflicts(session, preferred_entry, contact_id)
+    if conflict_resp and conflict_resp.get("CaptainTeeTimeConflictsFound"):
+        log.warning("Tee time conflict detected — you may already have a booking")
+
+    if DRY_RUN:
+        booking_elapsed = time.time() - booking_start
+        total_elapsed = time.time() - overall_start
+        log.info("=" * 60)
+        log.info(f"DRY RUN — stopping before finish")
+        log.info(f"Would book: {display_time} on {target_day_str}")
+        log.info(f"Players: {NUM_PLAYERS}")
+        log.info("-" * 60)
+        log.info(f"  Cloudflare:       {cf_elapsed:.1f}s")
+        log.info(f"  Login + Search:   {search_elapsed:.1f}s")
+        log.info(f"  Booking:          {booking_elapsed:.1f}s")
+        log.info(f"  TOTAL:            {total_elapsed:.1f}s")
+        log.info("=" * 60)
     else:
-        log.error(f"All {MAX_ATTEMPTS} booking attempts failed!")
+        finish_resp = finish_booking(session, contact_id, session_id)
+        if not finish_resp or not finish_resp.get("IsSuccessful"):
+            log.error(f"Finish call failed: {finish_resp.get('StatusText', 'unknown') if finish_resp else 'no response'}")
+            sys.exit(1)
+
+        booking_elapsed = time.time() - booking_start
+        total_elapsed = time.time() - overall_start
+        log.info("=" * 60)
+        log.info("BOOKING SUCCESSFUL!")
+        log.info(f"  Time: {display_time} on {target_day_str}")
+        log.info(f"  Confirmation: {finish_resp.get('ConfirmationNumber', '?')}")
+        log.info(f"  Location: {finish_resp.get('Location', '?')}")
+        log.info(f"  Players: {finish_resp.get('NumberOfPlayers', '?')}")
+        log.info(f"  Total Price: ${finish_resp.get('TotalPrice', '?')}")
+        log.info(f"  Cancel By: {finish_resp.get('CancellationDeadline', '?')}")
+        log.info("-" * 60)
+        log.info(f"  Cloudflare:       {cf_elapsed:.1f}s")
+        log.info(f"  Login + Search:   {search_elapsed:.1f}s")
+        log.info(f"  Booking:          {booking_elapsed:.1f}s")
+        log.info(f"  TOTAL:            {total_elapsed:.1f}s")
+        log.info("=" * 60)
         sys.exit(1)
 
 
