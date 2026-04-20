@@ -667,13 +667,14 @@ async def main():
     session_id, csrf_token, contact_id = login(session)
 
     # ---------------------------------------------------------------
-    # Wait for booking window (if before drop time)
+    # Wait for booking window (only on 14-day-out drop runs)
     # ---------------------------------------------------------------
     now = datetime.now()
     drop_time = now.replace(hour=BOOKING_HOUR, minute=BOOKING_MINUTE, second=0, microsecond=0)
     poll_start = drop_time - timedelta(seconds=POLL_LEAD_SECS)
+    is_drop_run = DAYS_OUT == 14 and now < drop_time
 
-    if now < poll_start:
+    if is_drop_run and now < poll_start:
         wait_secs = (poll_start - now).total_seconds()
         log.info(f"Pre-positioned! Waiting {wait_secs:.0f}s until {poll_start.strftime('%H:%M:%S')} to start polling...")
         log.info(f"Drop time: {drop_time.strftime('%H:%M:%S')}, polling starts {POLL_LEAD_SECS}s early")
@@ -697,7 +698,7 @@ async def main():
     # ---------------------------------------------------------------
     # Phase 3: Search + Book via API
     # ---------------------------------------------------------------
-    if now < drop_time:
+    if is_drop_run:
         # Poll for morning times to appear
         POLL_INTERVAL = 5        # seconds between searches
         POLL_TIMEOUT_MIN = 15    # give up after this many minutes past drop
@@ -729,7 +730,10 @@ async def main():
         if not found_morning:
             log.warning(f"No morning times appeared after {poll_attempt} polls ({POLL_TIMEOUT_MIN} min timeout) — using best available")
     else:
-        log.info("Booking window already open, searching immediately...")
+        if DAYS_OUT != 14:
+            log.info(f"Not a drop run (DAYS_OUT={DAYS_OUT}), searching immediately...")
+        else:
+            log.info("Booking window already open, searching immediately...")
         tee_times, rate_types = search_tee_times(session, target_date_str, NUM_PLAYERS)
 
     if not tee_times:
