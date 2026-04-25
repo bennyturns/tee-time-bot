@@ -149,7 +149,7 @@ async def pass_cloudflare():
     """Use browser to pass Cloudflare, return browser_session."""
     log.info("Phase 1: Passing Cloudflare with browser...")
 
-    llm = ChatAnthropic(model="claude-sonnet-4-20250514", api_key=ANTHROPIC_API_KEY)
+    llm = ChatAnthropic(model="claude-sonnet-4-6", api_key=ANTHROPIC_API_KEY)
     browser_profile = BrowserProfile(
         headless=False,
         disable_security=False,
